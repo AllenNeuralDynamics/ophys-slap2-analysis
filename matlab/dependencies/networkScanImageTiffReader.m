@@ -1,5 +1,7 @@
 function [data, desc, meta] = networkScanImageTiffReader(fname, localDr)
 
+import ScanImageTiffReader.ScanImageTiffReader;
+
 [dr, name, ext] = fileparts(fname);
 tmpFileName = [name ext];
 
