@@ -82,16 +82,22 @@ outputPathCh2corr = [tiffFn{1}(1:end-4) '-CORR_Ch2.ome.tif'];
 
 bfCheckJavaPath;
 metadata1 = createMinimalOMEXMLMetadata(squeeze(IM(:,:,1,:)));
-metadata2 = createMinimalOMEXMLMetadata(squeeze(IM(:,:,2,:)));
 pixelSizeObj = ome.units.quantity.Length(java.lang.Double(pixelSizeUm), ome.units.UNITS.MICROMETER);
-metadata1.setPixelsPhysicalSizeX(pixelSizeObj,0); metadata2.setPixelsPhysicalSizeX(pixelSizeObj, 0);
-metadata1.setPixelsPhysicalSizeY(pixelSizeObj, 0); metadata2.setPixelsPhysicalSizeY(pixelSizeObj, 0);
+metadata1.setPixelsPhysicalSizeX(pixelSizeObj,0);
+metadata1.setPixelsPhysicalSizeY(pixelSizeObj, 0);
 pixelSizeZObj = ome.units.quantity.Length(java.lang.Double(abs(zStep)), ome.units.UNITS.MICROMETER);
-metadata1.setPixelsPhysicalSizeZ(pixelSizeZObj, 0); metadata2.setPixelsPhysicalSizeZ(pixelSizeZObj, 0);
+metadata1.setPixelsPhysicalSizeZ(pixelSizeZObj, 0); 
 bfsave(squeeze(IM(:,:,1,:)), outputPathCh1, 'BigTiff', true, 'metadata', metadata1);
-bfsave(squeeze(IM(:,:,2,:)), outputPathCh2, 'BigTiff', true, 'metadata', metadata2);
 bfsave(squeeze(IMc(:,:,1,:)), outputPathCh1corr, 'BigTiff', true);
-bfsave(squeeze(IMc(:,:,2,:)), outputPathCh2corr, 'BigTiff', true);
+
+if size(IM,3) == 2
+    metadata2 = createMinimalOMEXMLMetadata(squeeze(IM(:,:,2,:)));
+    metadata2.setPixelsPhysicalSizeX(pixelSizeObj, 0);
+    metadata2.setPixelsPhysicalSizeY(pixelSizeObj, 0);
+    metadata2.setPixelsPhysicalSizeZ(pixelSizeZObj, 0);
+    bfsave(squeeze(IM(:,:,2,:)), outputPathCh2, 'BigTiff', true, 'metadata', metadata2);
+    bfsave(squeeze(IMc(:,:,2,:)), outputPathCh2corr, 'BigTiff', true);
+end
 
 function [refPlane, corrPlane] = alignMultiChannel(IMs, b,a)
 Y = squeeze(makeHighPass(sum(IMs,3))); % data order is XYCTZV
