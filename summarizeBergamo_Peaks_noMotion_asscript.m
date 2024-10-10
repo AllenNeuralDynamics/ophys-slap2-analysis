@@ -9,11 +9,12 @@ addpath(genpath('matlab'));
 %fns = 'scan_00001_20240720_100000_REGISTERED_DOWNSAMPLED-2x.tif'
 % summarizeBergamo_Peaks(dr, fn)
 
-dr = '/local/data/iGluSnFR-simulation/113'
-fns = 'SIMULATION_scan_00001_113_Trial1.tif'
+dr = '/local/data/iGluSnFR-simulation/65'
+fns = 'SIMULATION_scan_00001_65_Trial1.tif'
 
-Tmax = 50000;
-
+% begin ADDED
+ds_time = 0; % the movie is downsampled using averaging in time by a factor of 2^ds_time
+% end ADDED
 
 params.tau_s = 0.027; % time constant in seconds for glutamate channel; from Aggarwal et al 2023 Fig 5
 params.sigma_px = 1.33;   % space constant in pixels
@@ -28,8 +29,8 @@ params.baselineWindow_Glu_s = 2; %timescale for calculating F0 in glutamate chan
 params.baselineWindow_Ca_s = 2; %timescale for calculating F0 in calcium channel, seconds
 
 % begin ADDED
+params.dsFac = 2^ds_time;
 params.frametime = 0.0023;
-params.dsFac = 1;
 activityChannel = 1;
 numChannels = 1
 % end ADDED
@@ -66,8 +67,14 @@ for trialIx = length(fns):-1:1
 
     %load the tiff
     [IM, desc, meta] = networkScanImageTiffReader([dr filesep fn]);
-    IM = IM(:,:,1:min(Tmax, size(IM, 3)));
     IM = double(IM);
+    % begin ADDED
+    if ds_time > 0
+        for ix = 1:ds_time
+            IM = IM(:,:,1:2:(2*floor(end/2)))+ IM(:,:,2:2:end);
+        end
+    end
+    % end ADDED
     % A = ScanImageTiffReader([dr filesep fn]);
     % IM = double(A.data);
     if size(IM,3)<100
@@ -398,3 +405,15 @@ for trialIx = validTrials
 end
 clear rawIMs
 
+% begin ADDED
+out_dr = strrep(dr, '/local/data', '/local/results')
+mkdir(out_dr)
+if ds_time>0
+    save([out_dr filesep strrep(fns{1}, '.tif', ...
+        ['_DOWNSAMPLED-' num2str(params.dsFac) 'x.h5'])], "-v7.3")
+else
+    save([out_dr filesep strrep(fns{1}, 'tif', 'h5')], "-v7.3")
+end
+% end ADDED
+
+%tmp = reshape(selPix(repmat(any(selPix,3), 1, 1, size(selPix, 3))), nSelPix, []);
