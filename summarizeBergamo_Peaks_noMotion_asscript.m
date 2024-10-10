@@ -9,8 +9,9 @@ addpath(genpath('matlab'));
 %fns = 'scan_00001_20240720_100000_REGISTERED_DOWNSAMPLED-2x.tif'
 % summarizeBergamo_Peaks(dr, fn)
 
-dr = '/local/data/iGluSnFR-simulation/65'
-fns = 'SIMULATION_scan_00001_65_Trial1.tif'
+exp_id = 65
+dr = ['/local/data/iGluSnFR-simulation/' int2str(exp_id)]
+fns = ['SIMULATION_scan_00001_' int2str(exp_id) '_Trial1.tif']
 
 % begin ADDED
 ds_time = 0; % the movie is downsampled using averaging in time by a factor of 2^ds_time
