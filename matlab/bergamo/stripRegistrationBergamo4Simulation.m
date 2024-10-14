@@ -1,24 +1,27 @@
-addpath(genpath('matlab'));
-
-exp_id = 257
-dr = ['/local/data/iGluSnFR_simulations/' int2str(exp_id)]
-fn = ['SIMULATION_scan_00001_' int2str(exp_id) '_Trial1.tif']
-
+function stripRegistrationBergamo4Simulation(fn, ds_time, frametime)
 % begin ADDED
-ds_time = 1; % the movie is downsampled using averaging in time by a factor of 2^ds_time
-frametime = 0.0023;
 numChannels = 1;
 selCh = 1
 % end ADDED
-
 maxshift = 50;
 clipShift = 10; %the maximum allowable shift per frame
 % alpha = 0.0005; %exponential time constant for template
 removeLines = 4;
-
+if nargin<1 || isempty(fn)
+    fns = uipickfiles('FilterSpec','*.tif');
+    % [fns, dr] = uigetfile('*.tif', 'multiselect', 'on');
+else
+    % [dr,fns, ext] = fileparts(fn);
+    % fns = strcat(dr,fns,ext);
+    fns = fn;
+end
+if nargin<2 || isempty(ds_time)
+    ds_time = 1; % the movie is downsampled using averaging in time by a factor of 2^ds_time
+end
 dsFac = 2^ds_time;
-
-fns = [dr filesep fn];
+if nargin<3 || isempty(frametime)
+    frametime = 0.0023; % default frametime in seconds
+end
 if ~iscell(fns)
     fns = {fns};
 end
@@ -34,44 +37,6 @@ for f_ix = 1:length(fns)
 
     % A = ScanImageTiffReader([dr filesep fn]);
     % desc=A.descriptions();
-
-
-    % evalc(desc{1});
-    % datestr(epoch);
-    % %YYYYMMDDHHMMSS
-    % dateAcqAsString = ['_' num2str(epoch(1), '%04i') num2str(epoch(2), '%02i') num2str(epoch(3), '%02i') '_' num2str(epoch(4), '%02i') num2str(epoch(5), '%02i') num2str(round(epoch(6)), '%02i')];
-    % if ~exist([dr filesep fn(1:end-4) dateAcqAsString], 'dir')
-    %     mkdir([dr filesep fn(1:end-4) dateAcqAsString]);
-    % end
-    % fnstem = [dr filesep fn(1:end-4) dateAcqAsString filesep fn(1:end-4) dateAcqAsString];
-    % copyfile([dr filesep fn], [fnstem '.tif']);
-    % 
-    % % meta = A.metadata;
-    % metaLines = strsplit(meta, '\n');
-    % for lineIx = 1:length(metaLines)
-    %     try
-    %         evalc([metaLines{lineIx} ';']);
-    %     catch
-    %     end
-    % end
-    % numChannels = length(SI.hChannels.channelSave);
-
-    % if nargin<2 || isempty(selCh)
-    %     selCh = 1:numChannels;
-    % else
-    %     if any(selCh < 1) || any(selCh > numChannels)
-    %         disp('Invalid channel selection')
-    %         selCh = 1:numChannels;
-    %     end
-    % end
-
-    % pat = "frameTimestamps_sec = " + digitsPattern + "." + digitsPattern;
-    % for frame = 1:10*numChannels %compute the framerate from the metadata by reading a few frames
-    %     E = extract(desc{frame}, pat);
-    %     timestamp(frame) = str2double(E{1}(23:end)); %#ok<AGROW>
-    % end
-    % 
-    % frametime = median(diff(timestamp(1:numChannels:end)));
 
     % Ad = single(A.data);
     Ad = permute(reshape(Ad, size(Ad,1), size(Ad,2), numChannels, []), [2 1 3 4]);
@@ -241,7 +206,7 @@ for f_ix = 1:length(fns)
 
     %save a downsampled aligned recording
     % begin ADDED
-    out_dr = strrep(dr, '/local/data', '/local/results');
+    out_dr = strrep(dr, '/data', '/results');
     mkdir(out_dr)
     fnstem = [out_dr filesep fn(1:end-4)]; 
     if ds_time>0
@@ -347,34 +312,34 @@ for f_ix = 1:length(fns)
     save([fnstem '_ALIGNMENTDATA.mat'], 'aData');
 end
 
-% end
+end
 
-% function Y = downsampleTime(Y, ds_time)
-% for ix = 1:ds_time
-%     Y = Y(:,:,:,1:2:(2*floor(end/2)))+ Y(:,:,:,2:2:end);
-% end
-% end
+function Y = downsampleTime(Y, ds_time)
+for ix = 1:ds_time
+    Y = Y(:,:,:,1:2:(2*floor(end/2)))+ Y(:,:,:,2:2:end);
+end
+end
 
-% function [Y, readsuccess, done] = readFrames(tiffObj, nFramesToRead, nChannels)
-% nReads = nFramesToRead*nChannels;
-% done = false;
-% Y = single(tiffObj.read);
-% Y(:,:,2:nReads) = nan;
-% try
-%     for r = 2:nReads
-%         tiffObj.nextDirectory;
-%         Y(:,:,r) = tiffObj.read;
-%     end
-% catch ME %#ok<NASGU>
-%     readsuccess = false;
-%     return
-% end
-% Y = reshape(Y, size(Y,1), size(Y,2), nChannels, nFramesToRead);
-% readsuccess = true;
-% try
-%     tiffObj.nextDirectory;
-% catch
-%     disp('reached End of File');
-%     done = true;
-% end
-% end
+function [Y, readsuccess, done] = readFrames(tiffObj, nFramesToRead, nChannels)
+nReads = nFramesToRead*nChannels;
+done = false;
+Y = single(tiffObj.read);
+Y(:,:,2:nReads) = nan;
+try
+    for r = 2:nReads
+        tiffObj.nextDirectory;
+        Y(:,:,r) = tiffObj.read;
+    end
+catch ME %#ok<NASGU>
+    readsuccess = false;
+    return
+end
+Y = reshape(Y, size(Y,1), size(Y,2), nChannels, nFramesToRead);
+readsuccess = true;
+try
+    tiffObj.nextDirectory;
+catch
+    disp('reached End of File');
+    done = true;
+end
+end

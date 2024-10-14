@@ -9,8 +9,10 @@ fns = 'scan_00003_20240816_100000_REGISTERED_DOWNSAMPLED-2x.tif'
 %fns = 'scan_00001_20240720_100000_REGISTERED_DOWNSAMPLED-2x.tif'
 % summarizeBergamo_Peaks(dr, fn)
 
-%dr = '/local/data/iGluSnFR-simulation/113'
-%fns = 'SIMULATION_scan_00001_113_Trial1.tif'
+exp_id = 53
+dr = ['/local/results/iGluSnFR_simulations/' int2str(exp_id)]
+fns = ['SIMULATION_scan_0000' int2str(mod(exp_id, 8)) '_' int2str(exp_id) '_Trial1_REGISTERED_DOWNSAMPLED-2x.tif']
+%fns = ['SIMULATION_scan_00001_' int2str(exp_id) '_Trial1_REGISTERED_RAW.tif']
 
 Tmax = 50000;
 
@@ -380,3 +382,8 @@ for trialIx = validTrials
 end
 clear rawIMs
 
+% begin ADDED
+out_dr = strrep(dr, '/local/data', '/local/results')
+mkdir(out_dr)
+save([out_dr filesep strrep(fns{1}, 'tif', 'h5')], "-v7.3")
+% end ADDED
