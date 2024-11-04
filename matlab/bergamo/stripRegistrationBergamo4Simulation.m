@@ -92,6 +92,7 @@ for f_ix = 1:length(fns)
     F = mean(F,3); %fixed image
     % F = mean(sqrt(abs(F)).*sign(F),3); %fixed image
     template = nan(2*maxshift+sz(1), 2*maxshift+sz(2));
+    templateFull = template;
     T0 = template; T00 = zeros(size(template)); templateCt = zeros(size(template));
     T0(maxshift+(1:sz(1)), maxshift+(1:sz(2)))=F;
     clear Y Yhp;
@@ -162,9 +163,10 @@ for f_ix = 1:length(fns)
             aRankCorr(DSframe) = corr(Asmooth(selCorr), Ttmp(selCorr), 'type', 'Spearman');
             recNegErr(DSframe) = mean(min(0, Asmooth(selCorr) .* mean(Ttmp(selCorr)) ./ mean(Asmooth(selCorr)) - Ttmp(selCorr)).^2);
             
-            template = sum(cat(3,template .* templateCt, A),3,"omitnan");
+            templateFull = sum(cat(3,templateFull .* templateCt, A),3,"omitnan");
             templateCt = templateCt + ~isnan(A);
-            template = template ./ templateCt;
+            templateFull = templateFull ./ templateCt;
+            template = templateFull;
             template(templateCt < 100) = nan;
 
             initR = round(motionDSr(DSframe));
