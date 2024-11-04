@@ -182,7 +182,9 @@ params.minEvents = totalFrames*params.frametime*params.dsFac*params.eventRateThr
 [~, P, sources.R, sources.C, params] = clusterLocalizations(peaksCat, params);
 k = length(sources.R); %number of sources
 sz = params.sz;
-
+% begin ADDED
+if k>0 
+% end ADDED
 %Generate IMsel; the data only in the selected region, aligned across movies
 selPix = false(sz(1:2));
 for sourceIx = k:-1:1
@@ -209,7 +211,6 @@ for trialIx = validTrials
     end
     frameInd = frameInd+szTmp(3);
 end
-
 clear rawIMs
 
 %extract sources from the downsampled movies
@@ -362,6 +363,7 @@ for trialIx = validTrials
     exptSummary.dFFls{trialIx} = exptSummary.dFls{trialIx}./exptSummary.F0{trialIx};
 end
 % begin ADDED
+end
 end
 % end ADDED
 
