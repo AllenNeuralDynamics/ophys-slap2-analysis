@@ -1,52 +1,23 @@
-function summarizeBCI(dr)
-    %TO DO:
-    %PARAMETER SENSITIVITY ANALYSIS
-
-    %add some global NMF components?
-        %initialize with random values
-%cd('\\allen\aind\scratch\ophys\BCI\inactive_mice\709390_SBCI12\SLAP2\slap2_709390_2024-01-10_12-17-31')
-%cd('C:\temp\SYNAPSES\Test');
-%cd('C:\Users\kaspar.podgorski\OneDrive - Allen Institute\Documents\GitHub\ophys-slap2-analysis\matlab\rasterDataProcessing\Bergamo\simulations\data\SIMULATIONS')
-if isempty(gcp('nocreate'))
-    nWorkers = 10;
-    if nWorkers<15
-        warning('You are using few parallel workers! adjust this in summarizeBCI.m');
-    end
-    disp(['Parallel workers:' int2str(nWorkers)])
-    parpool('processes',nWorkers); %limit the number of workers to avoid running out of RAM %4-30-24, lowering processes again to prevent another error (18 --> 15)
+function summarizeSLAP2(dr, paramsIn)
+%PARAMETER SETTING
+if nargin>2
+    params = setParams('summarizeSLAP2', paramsIn);
+else
+    params = setParams('summarizeSLAP2');
 end
+
+delete(gcp('nocreate'))
+nWorkers = 8;
+if nWorkers<8
+    warning('You are using few parallel workers! adjust this in summarizeBCI.m');
+end
+disp(['Parallel workers:' int2str(nWorkers)])
+parpool('processes',nWorkers); %limit the number of workers to avoid running out of RAM %4-30-24, lowering processes again to prevent another error (18 --> 15)
 disp(['## SUMMARIZEBCI ##' newline 'Folder:'])
 disp(dr)
+
+
 nDMDs = 2;
-
-%general params
-params.analyzeHz = 200; %frame rate used for analysis
-params.discardInitial_s = 0.1; %discard the first short period of each trial as the beam stabilization locks on and the imaging system warms up
-
-%filtering params
-params.sigma_px = 1.5; %1.33;   % space constant in pixels
-done = false;
-while ~done
-    params.tau_s = str2double(inputdlg('Time constant of glutamate indicator (s)?', 'tau', 1, {'0.05'}));
-    done = params.tau_s>0 && params.tau_s<1;
-end
-%params.tau_s = 0.027; % time constant in seconds for glutamate channel; from Aggarwal et al 2023 Fig 5
-%params.denoiseWindow_samps = 20; %number of samples to average together for denoising; REFACTOR THIS OUT AND USE SECONDS!
-params.denoiseWindow_s = 0.25; %number of samples to average together for denoising
-params.baselineWindow_Glu_s = 2; %timescale for calculating F0 in glutamate channel, seconds
-params.baselineWindow_Ca_s = 2; %timescale for calculating F0 in calcium channel, seconds
-
-%localization params
-params.eventRateThresh_hz = 0.01; % minimum event rate in Hz
-params.tilesizeLoc = 64; %Tile size used for computing statistics for localization; Accounts for image statistics varying slowly across FOV.
-params.threshSNRloc = 12; %6; % Z-score threshold for calling a localization
-params.threshSKloc = 4; %threshold on skewness-based summary statistic for pixels to consider for localizations
-params.upsample = 3; %how many times to upsample the imaging resolution for finding local maxima to identify sources; affects maximum source density
-
-%NMF params
-params.sparseFac = 0.08; %sparsity factor for shrinking sources in space, 0-1, higher value makes things sparser
-params.nmfIter = 5; %number of iterations of NMF refinement
-params.dXY = 4; %how large sources can be (radius), pixels
 params.nmfBackgroundComps = 0; % <=4, max number of background components to use for NMF. If 0, we compute F0 instead of fitting background
 
 %load trial table
@@ -127,13 +98,13 @@ for DMDix = nDMDs:-1:1
 disp('Loading data and performing localizations...')
 
 %Perform Localizations
-mIM = cell(1, nTrials); aIM = cell(1,nTrials); alignData = cell(1, nTrials); peaks = []; discardFrames = cell(1,nTrials); %rawIMs = cell(1,nTrials);
+mIM = cell(1, nTrials); aIM = cell(1,nTrials); alignData = cell(1, nTrials); peaks = cell(1, nTrials); discardFrames = cell(1,nTrials); %rawIMs = cell(1,nTrials)
 parfor trialIx = 1:nTrials
     if keepTrials(DMDix,trialIx)
         trialStr = ['E' int2str(trialTable.epoch(trialIx)) 'T' int2str(trialIx) 'DMD' int2str(DMDix)];
         fobj = dir([dr filesep trialStr '_REGISTERED_DOWNSAMPLED-*Hz.tif']);
         fn = fobj(1).name;
-        [~, mIM{trialIx}, aIM{trialIx}, alignData{trialIx}, peaks(trialIx), discardFrames{trialIx}]= loadAndLocalizeTrialAsync(dr, fn, numChannels, params); %rawIMs{trialIx}
+        [~, mIM{trialIx}, aIM{trialIx}, alignData{trialIx}, peaks{trialIx}, discardFrames{trialIx}]= loadAndProcessTrialAsync(dr, fn, numChannels, params); %rawIMs{trialIx}
     end
 end
 %Assemble same-sized mean images from different-sized trial means
@@ -157,10 +128,9 @@ template = makeTemplateMultiRoi(M(:,:,keepTrials(DMDix,:)), maxshift);
 
 %align all mean images to template
 disp('Aligning across trials...')
-meanAligned = []; actAligned = []; 
+meanAligned = []; actAligned = []; pAligned = []; 
 corrCoeff = nan(1,nTrials);
 motOutput = nan(2,nTrials);
-peaksCat = struct;
 Mpad = nan([size(template) size(M,3)]);
 Mpad(maxshift+(1:size(M,1)), maxshift+(1:size(M,2)),:) = M;
 for trialIx = nTrials:-1:1
@@ -180,43 +150,58 @@ end
 
 %identify outliers in alignment quality to determine valid trials
 ccf = corrCoeff;
-if nargin>1 && forceCorrThresh>0
-    corrThresh = forceCorrThresh;
-else
-    corrThresh = min(0.90, median(ccf, 'omitnan')-2*std(ccf, 'omitmissing'));
-end
+corrThresh = min(0.90, median(ccf, 'omitnan')-2*std(ccf, 'omitmissing'));
+
 validTrials= find(ccf>corrThresh);
 exptSummary.meanIM{DMDix} = mean(meanAligned(:,:,:,validTrials),4, 'omitnan');
-exptSummary.actIM{DMDix} = mean(actAligned(:,:,:,validTrials), 4, 'omitnan');
+actIM = mean(actAligned(:,:,:,validTrials), 4, 'includenan');
+exptSummary.actIM{DMDix} = actIM;
 
 %accumulate peaks, only from valid trials
-nValidFramesDS = 0;
+peaksCat = struct;
 for vTrialIx = 1:length(validTrials)
     trialIx = validTrials(vTrialIx);
     if ~isfield(peaksCat, 'row')
-        peaksCat.row = peaks(trialIx).row - motOutput(1,trialIx);
-        peaksCat.col = peaks(trialIx).col - motOutput(2,trialIx);
-        peaksCat.val = peaks(trialIx).val;
-        peaksCat.t = peaks(trialIx).t;
-         % figure, imagesc(template)
-         % hold on, scatter( maxshift+ peaks(trialIx).col - motOutput(2,trialIx), maxshift+ peaks(trialIx).row - motOutput(1,trialIx));
+        peaksCat.row = peaks{trialIx}.row - motOutput(1,trialIx);
+        peaksCat.col = peaks{trialIx}.col - motOutput(2,trialIx);
+        peaksCat.val = peaks{trialIx}.val;
     else
-        peaksCat.row = cat(2, peaksCat.row, peaks(trialIx).row - motOutput(1,trialIx));
-        peaksCat.col = cat(2, peaksCat.col, peaks(trialIx).col - motOutput(2,trialIx));
-        peaksCat.val = cat(1, peaksCat.val, peaks(trialIx).val);
-        peaksCat.t = peaksCat.t + size(discardFrames{trialIx},1);
-        peaksCat.t = cat(1,peaksCat.t, peaks(trialIx).t+nValidFramesDS);
-         % hold on, scatter( maxshift+ peaks(trialIx).col - motOutput(2,trialIx), maxshift+ peaks(trialIx).row - motOutput(1,trialIx));
+        peaksCat.row = cat(1, peaksCat.row, peaks{trialIx}.row - motOutput(1,trialIx));
+        peaksCat.col = cat(1, peaksCat.col, peaks{trialIx}.col - motOutput(2,trialIx));
+        peaksCat.val = cat(1, peaksCat.val, peaks{trialIx}.val);
     end
-    nValidFramesDS=  nValidFramesDS + size(discardFrames{trialIx},1);
 end
 
+%select sources
+%strategy 1: find peaks directly on aligned activity image
+actIM = mean(actAligned(:,:,:,validTrials), 4, 'includenan');
+pIM = actIM == ordfilt2(actIM, 9, ones(3)); 
+%Mask out somata from activity image
+somaMask = false(size(actIM));
+for rix = 1:numel(ROIs(DMDix).roiData)
+    if contains(upper(ROIs(DMDix).roiData{rix}.Label), 'SOMA')
+        tmp = ROIs(DMDix).roiData{rix}.mask;
+        somaMask(1:size(tmp,1), 1:size(tmp,2)) = somaMask(1:size(tmp,1), 1:size(tmp,2)) | tmp;
+    end
+end
+pIM(somaMask) = 0;
+p = actIM(pIM);
+sortedP = sort(p, 'descend');
+totalPix = sum(~isnan(actIM(:)) & ~somaMask(:));
+threshP = 2*sortedP(min(end, ceil(totalPix*params.maxSynapseDensity))); %maximum synapse density
+pp = actIM; pp(~pIM) = 0; pp(pp<threshP) = 0;
+[sources.R,sources.C,sources.V] = find(pp);
+sz = size(pp);
+k = length(sources.R);
+%strategy 2: use peaks
+%not implemented
+
 %cluster localizations
-totalFrames = sum(cellfun(@(x)(sum(~x)), discardFrames));
-params.minEvents = totalFrames*params.frametime*params.dsFac*params.eventRateThresh_hz;
-[~, P, sources.R, sources.C, params] = clusterLocalizations(peaksCat, params);
-k = length(sources.R); %number of sources
-sz = params.sz;
+% totalFrames = sum(cellfun(@(x)(sum(~x)), discardFrames));
+% params.minEvents = totalFrames*params.frametime*params.dsFac*params.eventRateThresh_hz;
+% [~, P, sources.R, sources.C, params] = clusterLocalizations(peaksCat, params);
+% k = length(sources.R); %number of sources
+% sz = params.sz;
 
 %Generate IMsel; the data only in the selected region, aligned across movies
 selPix = false([sz(1:2) k]);
@@ -248,12 +233,16 @@ end
 dFsel = cell2mat(dFsel); %collapse into an array
 
 %error checking
-assert(nValidFramesDS==size(dFsel,2));
-assert(max(P.t)<nValidFramesDS);
+%assert(nValidFramesDS==size(dFsel,2));
+%assert(max(P.t)<nValidFramesDS);
+
+%to do:
+%initialize extraction w Gaussians, not average events
+%low res extraction; option to use only top 10% most active frames
 
 %extract sources from downsampled movie dF
 try
-    [W0,~] = extractSourcesLoRes(dFsel, P, sources, selPix, params);
+    [W0,~] = extractSourcesLoRes(dFsel, sources, selPix, params);
 catch ME
     disp('fatal Error extracting sources')
     rethrow(ME)
@@ -268,7 +257,7 @@ parfor trialIx = 1:nTrials
         fnRaw = trialTable.(strcat('DMD', int2str(DMDix), 'filename')){trialIx};
         startLine=trialTable.(strcat('DMD', int2str(DMDix), 'firstLine'))(trialIx);
         endLine =trialTable.(strcat('DMD', int2str(DMDix), 'lastLine'))(trialIx);
-        E{trialIx} = processTrialAsync(dr, fnRaw, startLine, endLine, W0, F0selDS{trialIx}, selPix, discardFrames{trialIx}, alignData{trialIx}, mIM{trialIx}, motOutput(:,trialIx), roiData, params);
+        E{trialIx} = processTrialAsync_2(dr, fnRaw, startLine, endLine, W0, F0selDS{trialIx}, selPix, discardFrames{trialIx}, alignData{trialIx}, mIM{trialIx}, motOutput(:,trialIx), roiData, params);
     end
 end
 
@@ -481,7 +470,7 @@ for sourceIx = 1:k
 end
 end
 
-function [W0,H0] = extractSourcesLoRes(dFsel, peaks, sources, selPix, params)
+function [W0,H0] = extractSourcesLoRes(dFsel, sources, selPix, params)
 %dFsel: delta fluorescence over selected pixels;  has dimensions [pixels time]
 
 k = length(sources.R);
@@ -501,68 +490,76 @@ meanDF(isnan(meanDF)) = 0;
 dFselTf(selNans) = meanDF(selNans);
 
 nComp = k; %we could use extra components for background if desired
-W0 = nan(nSelPix, nComp);
-spatialScore = nan(1,nComp);
+W0 = zeros(nSelPix, nComp);
 for sourceIx = 1:k
-    thresh = min(prctile(peaks.assignProbs(peaks.assignments==sourceIx,sourceIx), 33), 0.5);
-    selPeaks = find(peaks.assignProbs(:,sourceIx)>thresh);
-
     %create a selection vector for indexing into the smaller dFsel matrix
     selSel = selPix(:,:,sourceIx);
     [rr,cc] = find(selSel);
-    spatialTemplate = mvnpdf(cat(2,rr,cc), [mean(rr) mean(cc)], params.sigma_px*eye(2)); % we will score each source based on how much the average event looks like a centered gaussian
+    spatialTemplate = mvnpdf(cat(2,rr,cc), [sources.R(sourceIx) sources.C(sourceIx)], params.sigma_px*eye(2)); % we will score each source based on how much the average event looks like a centered gaussian
     selSel = selSel(anySel);
-
-    allEventsThisSite = nan(sum(selSel(:)), length(selPeaks));
-    for eIx = 1:length(selPeaks)
-        T = peaks.t(selPeaks(eIx));
-        allEventsThisSite(:,eIx) = dFselTf(selSel, T);
-    end
-    avgEvent = mean(allEventsThisSite,2, 'omitmissing');
-    spatialScore(sourceIx) = corr(avgEvent,spatialTemplate).*sum(avgEvent);
-    thresh = max(avgEvent(:))*1e-5;
-    avgEvent(avgEvent<thresh) = thresh;
-    W0(selSel,sourceIx) = avgEvent;
+    W0(selSel,sourceIx) = spatialTemplate./max(spatialTemplate(:));
 end
 
 %discard sources with poor spatial profiles/response amplitudes
-spaceThresh = median(spatialScore, 'omitmissing')/3;
-W0 = W0(:, spatialScore>spaceThresh);
-W0(isnan(W0)) = 0;
 nComp = size(W0,2);
-
 W0full = zeros(sz(1)*sz(2),nComp);
 W0full(anySel(:),:) = W0;
 W0full = reshape(W0full, sz(1),sz(2),[]);
-W0full = min(W0full, imgaussfilt(W0full, params.sigma_px/2));
-W0full = reshape(W0full, sz(1)*sz(2),[]);
-W0 =  W0full(anySel,:);
+
+W00full = imgaussfilt(double(W0full>0), 1).^3;
+W00full(W0full==0) = 0;
+
+%W0full = min(W0full, imgaussfilt(W0full, params.sigma_px/2));
+%W0full = reshape(W0full, sz(1)*sz(2),[]);
+%W0 =  W0full(anySel,:);
+
+% H0 = W0\dFselTf;
+% nActive = sum(H0>prctile(H0,99,2),1);
+% selTime = nActive>
 
 %Use multiplicative updates NMF, which makes it easy to zero out pixels
-opts1 = statset('MaxIter', 6,  'Display', 'final');
+opts1 = statset('MaxIter', 4,  'Display', 'final');
 [W0,H0] = nnmf2(dFselTf, nComp,'algorithm', 'mult', 'w0',W0, 'options', opts1); %!!nnmf has been modified to allow it to take more than rank(Y) inputs
-for bigIter = 1:(params.nmfIter+3)
-    H0 = H0+sqrt(0.1/size(H0,2)); %get rid of zeroing out effect
-    disp(['outer loop ' int2str(bigIter) ' of ' int2str(params.nmfIter)]);
-
-    %apply sparsity
-    W0 = max(0, W0-params.sparseFac.*max(W0,[],1));
+for bigIter = 1:params.nmfIter
+    H0 = H0+sqrt(0.1/size(H0,2)); %get rid of any zeroing out effect on activity
+    disp(['outer loop ' int2str(bigIter) ' of ' int2str(params.nmfIter)]);   
+    W0 = max(0, W0-params.sparseFac.*max(W0,[],1)); %sparsify
+    [W0,H0] = nnmf2(dFselTf, nComp,'algorithm', 'mult', 'w0', W0, 'h0', H0, 'options', opts1); %'h0', H0
     
-    W0full = zeros(sz(1)*sz(2),nComp);
-    W0full(anySel(:),:) = W0;
-    W0full = reshape(W0full, sz(1),sz(2),[]);
-    W0full = min(W0full, imgaussfilt(W0full, params.sigma_px/2)); %sculpt the spatial profiles
-    W0full = reshape(W0full, sz(1)*sz(2),[]);
-    [W0,H0] = nnmf2(dFselTf, nComp,'algorithm', 'mult', 'w0', W0full(anySel,:), 'h0', H0, 'options', opts1);
+    % W0full = zeros(sz(1)*sz(2),nComp);
+    % W0full(anySel(:),:) = W0;
+    %W0full = reshape(W0full, sz(1),sz(2),[]);
+    %W0full = min(W0full, imgaussfilt(W0full, params.sigma_px/2)); %sculpt the spatial profiles
+    % W0full = reshape(W0full, sz(1)*sz(2),[]);
+    %[W0,H0] = nnmf2(dFselTf, nComp,'algorithm', 'mult', 'w0', W0full(anySel,:), 'h0', H0, 'options', opts1);
 
-    if bigIter == params.nmfIter
+    if bigIter == 2
         disp('Merging sources...')
-        [W0,H0] = mergeSources(W0,H0, dFselTf, anySel);
-        disp(['Kept ' int2str(size(W0,2)) ' of ' int2str(nComp) 'sources']);
+        [W0,H0] = mergeSources_2(W0,H0,dFselTf, anySel);
+        disp(['Kept ' int2str(size(W0,2)) ' of ' int2str(nComp) ' sources']);
         nComp = size(W0,2);
+
+        W0full = zeros(sz(1)*sz(2),nComp);
+        W0full(anySel(:),:) = W0;
+        W0full = reshape(W0full, sz(1),sz(2),[]);
+        W00full = imgaussfilt(double(W0full>0), 1).^3;
+        W00full(W0full==0) = 0;
+    else
+        W0full = zeros(sz(1)*sz(2),nComp);
+        W0full(anySel(:),:) = W0;
+        W0full = reshape(W0full, sz(1),sz(2),[]);
+        W0full = W0full.*W00full; %shrink edges
+        W0full = reshape(W0full, sz(1)*sz(2),[]);
+        W0 =  W0full(anySel,:);
     end
 end
 
+% W0full = zeros(sz(1)*sz(2),nComp);
+% W0full(anySel(:),:) = W0;
+% W0full = reshape(W0full, sz(1),sz(2),[]);
+% % W00 = imgaussfilt(double(W0full>0), 3).^3;
+% % W00(W0full==0) = 0;
+% figure, imagesc(sum(W0full,3));
 %evaluate how well fit the data are
 %figure, imshow3D(cat(3,dFselTf, W0*H0, dFselTf-W0*H0));
 end
@@ -581,6 +578,6 @@ function [dFsel, F0selDS] = DFselAsync(path, discardFrames, selPix, motOutput, p
     sel2D = sel2D(1:szTmp(1), 1:szTmp(2));
     
     IMrawSel = interpArray(rawIM, sel2D, motOutput); %interpolates the movie at the shifted coordinates
-    F0selDS = svdF0_slap2(IMrawSel', 8, denoiseWindow, baselineWindow)';
+    F0selDS =   smoothdata(IMrawSel,2, 'movmean',baselineWindow,'omitmissing');%svdF0_slap2(IMrawSel', 8, denoiseWindow, baselineWindow)';
     dFsel = IMrawSel - F0selDS;
 end

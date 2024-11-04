@@ -1,4 +1,4 @@
-function [IMsel, F0,  W, selNans] = prepareNMFproblem(IMsel, W0, F0selDS, params)
+function [IMsel, IMselRaw, F0,  W, selNans] = prepareNMFproblem(IMsel, W0, F0selDS, params)
 if ~params.nmfBackgroundComps
     F0 = nan(size(IMsel));
     szDS = size(F0selDS);
@@ -11,10 +11,12 @@ if ~params.nmfBackgroundComps
     %F0 = computeF0(IMsel', params.denoiseWindow_samps*params.dsFac+1, baselineWindow, 1)';
     IMsel = IMsel - F0;
     
+    IMselRaw = IMsel;
     IMsel = matchedExpFilter(IMsel, params.tau_full);
     
     selNans = isnan(IMsel);
     IMsel(selNans) = 0;
+    IMselRaw(selNans) = 0;
 
     %IMsel = IMsel- computeF0(IMsel', params.denoiseWindow_samps*params.dsFac+1,baselineWindow, 1)';
     W = W0;

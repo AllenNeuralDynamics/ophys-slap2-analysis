@@ -57,11 +57,12 @@ IMf(nans) = 0;
 mem = IMf(:,:,end);
 gamma = exp(-1/tau);
 for t = size(IMf,3):-1:1
-    IMf(:,:,t) = max(0,gamma*mem) + (1-gamma)*IMf(:,:,t);
+    IMf(:,:,t) = gamma*mem + (1-gamma)*IMf(:,:,t);
     mem = IMf(:,:,t);
 end
 IMf(nans) = nan;
 
+IMf = IMf - mean(IMf,3, 'omitmissing');
 %compute a summary image based on skewness
 summary = mean(IMf.^3, 3, 'omitmissing');
 summary(imdilate(isnan(summary), ones(5))) = nan; %remove noisy edges

@@ -82,7 +82,11 @@ for f_ix = 1:length(fns)
     %make an initial template with normcorr
     initFrames = 1000;
     framesToRead = initFrames * dsFac;
-    Y = downsampleTime(Ad(:,:,:,1:framesToRead), ds_time);
+    try
+        Y = downsampleTime(Ad(:,:,:,1:framesToRead), ds_time);
+    catch ME
+        error(['Your file was too short:' fn])
+    end
     sz = size(Ad);
     Yhp = squeeze(sum(reshape(Y(:,:,selCh,:),size(Y,1),size(Y,2),[],size(Y,4)),3));
     %Yhp = Yhp-imgaussfilt(Yhp, 4); %highpass in space
@@ -123,6 +127,7 @@ for f_ix = 1:length(fns)
     F = mean(F,3); %fixed image
     % F = mean(sqrt(abs(F)).*sign(F),3); %fixed image
     template = nan(2*maxshift+sz(1), 2*maxshift+sz(2));
+    templateFull = template;
     T0 = template; T00 = zeros(size(template)); templateCt = zeros(size(template));
     T0(maxshift+(1:sz(1)), maxshift+(1:sz(2)))=F;
     clear Y Yhp;
@@ -193,9 +198,10 @@ for f_ix = 1:length(fns)
             aRankCorr(DSframe) = corr(Asmooth(selCorr), Ttmp(selCorr), 'type', 'Spearman');
             recNegErr(DSframe) = mean(min(0, Asmooth(selCorr) .* mean(Ttmp(selCorr)) ./ mean(Asmooth(selCorr)) - Ttmp(selCorr)).^2);
             
-            template = sum(cat(3,template .* templateCt, A),3,"omitnan");
+            templateFull = sum(cat(3,templateFull .* templateCt, A),3,"omitnan");
             templateCt = templateCt + ~isnan(A);
-            template = template ./ templateCt;
+            templateFull = templateFull ./ templateCt;
+            template = templateFull;
             template(templateCt < 100) = nan;
 
             initR = round(motionDSr(DSframe));

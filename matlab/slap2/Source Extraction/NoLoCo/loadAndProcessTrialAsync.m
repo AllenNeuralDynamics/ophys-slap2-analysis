@@ -1,4 +1,4 @@
-function  [rawIMs, meanIM, IMc, aData, peaks, discardFrames]= loadAndLocalizeTrialAsync(dr, fn, numChannels, params)
+function  [rawIMs, meanIM, IMc, aData, peaks, discardFrames]= loadAndProcessTrialAsync(dr, fn, numChannels, params)
     
     nInitFrames = ceil(params.discardInitial_s/params.frametime); %initial frames to discard
 
@@ -35,5 +35,5 @@ function  [rawIMs, meanIM, IMc, aData, peaks, discardFrames]= loadAndLocalizeTri
     rawIMs(:,:,discardFrames) = nan;
     
     
-    [IMc, peaks] = localizeFlashesSLAP2(rawIMs, aData, params);
+    [IMc, peaks] = localizeSourcesSLAP2(rawIMs, aData, params);
 end
