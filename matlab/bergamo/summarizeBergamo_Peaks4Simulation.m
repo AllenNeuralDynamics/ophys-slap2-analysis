@@ -693,6 +693,9 @@ W0full = reshape(W0full, sz(1),sz(2),[]);
 W0full = min(W0full, imgaussfilt(W0full, params.sigma_px/2));
 W0full = reshape(W0full, sz(1)*sz(2),[]);
 W0 =  W0full(anySel,:);
+% begin ADDED
+W0 = max(W0, 0);
+% end ADDED
 
 %Use multiplicative updates NMF, which makes it easy to zero out pixels
 opts1 = statset('MaxIter', 6,  'Display', 'final');%, 'UseParallel', true);

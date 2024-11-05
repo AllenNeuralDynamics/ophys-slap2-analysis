@@ -9,7 +9,7 @@ fns = 'scan_00003_20240816_100000_REGISTERED_DOWNSAMPLED-2x.tif';
 %fns = 'scan_00001_20240720_100000_REGISTERED_DOWNSAMPLED-2x.tif';
 % summarizeBergamo_Peaks(dr, fn)
 
-exp_id = 150
+exp_id = 293
 dr = ['/local/results/iGluSnFR_simulations/' int2str(exp_id)];
 fns = ['SIMULATION_scan_0000' int2str(mod(exp_id, 8)) '_' int2str(exp_id) '_Trial1_REGISTERED_DOWNSAMPLED-2x.tif'];
 %fns = ['SIMULATION_scan_00001_' int2str(exp_id) '_Trial1_REGISTERED_RAW.tif']
@@ -686,6 +686,9 @@ W0full = reshape(W0full, sz(1),sz(2),[]);
 W0full = min(W0full, imgaussfilt(W0full, params.sigma_px/2));
 W0full = reshape(W0full, sz(1)*sz(2),[]);
 W0 =  W0full(anySel,:);
+% begin ADDED
+W0 = max(W0, 0);
+% end ADDED
 
 %Use multiplicative updates NMF, which makes it easy to zero out pixels
 opts1 = statset('MaxIter', 6,  'Display', 'final');%, 'UseParallel', true);
