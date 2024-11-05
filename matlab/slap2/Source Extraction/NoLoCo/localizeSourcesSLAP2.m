@@ -22,7 +22,7 @@ end
 IMf = IM;
 IMf(repmat(~valid, 1, 1, nTimePoints)) = nan;
 nans = isnan(IMf);
-%clear IM
+clear IM
 
 %fill in missing values
 IMf= reshape(IMf, sz(1)*sz(2), []);
@@ -34,7 +34,6 @@ IMf(reshape(nans, size(IMf))) = IMs(reshape(nans, size(IMf)));
 IMf = reshape(IMf, sz(1),sz(2), []);
 
 %time match filter
-%IMf(nans) = 0;
 mem = max(0,IMf(:,:,end));
 gamma = exp(-1/tau);
 for t = size(IMf,3):-1:1
@@ -62,8 +61,6 @@ IMf(~nans) = log(max(IMf(~nans),0) + B); %convert to log space so linear filteri
 IMf = IMf - smoothdata(IMf, 3, 'movmean', baselineWindow, 'omitnan');  %- smoothdata(IMf, 3, 'movmedian', baselineWindow, 'omitnan'); 
 
 %Difference of Gaussians
-%B = median(IMf(:,:,end-50:end), 'all', 'omitnan');%prctile(IMf(:,:,1:100), 10, 'all'); %median(IMf(:,:,end-50:end), 'all', 'omitnan');
-%IMf(nans) = B;
 IMf(nans) = 0;
 IMf = imgaussfilt(IMf, [sigma sigma]);
 IMf = IMf - imgaussfilt(IMf, 5*[sigma sigma]);
@@ -71,9 +68,6 @@ IMf(nans) = nan;
 
 %we performed filtering in the log space to perform multiplicatoins; return to non-log space
 IMf = exp(IMf); 
-
-%Highpass filter in time
-%IMf = IMf - smoothdata(IMf, 3, 'movmean', baselineWindow, 'omitnan');  %- smoothdata(IMf, 3, 'movmedian', baselineWindow, 'omitnan'); 
 
 %clip outliers
 IMf = IMf-mean(IMf,3, 'omitmissing');
@@ -83,7 +77,6 @@ IMf = max(min(IMf, 6*stdIM, 'includemissing'), -6*stdIM, 'includemissing');
 summary = skewness(IMf(:,:, 1:end-3*ceil(tau)), 1,3).*IMgamma; %remove the last few points, these can be outliers
 
 summaryEroded = summary;
-
 % summaryEroded(isnan(summaryEroded)) = median(summaryEroded,'all', 'omitmissing');
 % summaryEroded = summaryEroded - imgaussfilt(summaryEroded, 5*[sigma sigma]);
 % summaryEroded(~valid) = nan;
@@ -92,7 +85,6 @@ summaryEroded = summary;
 %find local maxima
 peaks = summaryEroded == ordfilt2(summaryEroded, 9, ones(3)); %> circshift(summaryEroded,1,dim) &  summaryEroded > circshift(summaryEroded,-1,dim);
 
-%[r,c] = find(peaks);
 p = summaryEroded(peaks);
 sortedP = sort(p, 'descend');
 totalPix = sum(~isnan(summaryEroded(:)));

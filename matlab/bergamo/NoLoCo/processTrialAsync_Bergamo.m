@@ -26,10 +26,10 @@ function exptSummary = processTrialAsync_Bergamo(dr, fnRaw, ~, ~, W0, F0selDS, s
     if numChannels==2
         IM2 =  squeeze(IM(:,:,2,:));
         clear IM;
-        IM2sel = interpArray(IM2, any(selPix,3), motOutput); %interpolate the movie at the shifted coordinates
+         IM2sel = interpArray(IM2, any(selPix,3), motOutput); %interpolate the movie at the shifted coordinates
         clear IM2;
         IM2sel = IM2sel - min(0, min(mean(IM2sel,2, 'omitnan')));%ensure that the baseline is not overestimated
-        discard = reshape(repmat(discardFrames{trialIx}(:), 1,params.dsFac)', 1,[]); %upsample the discard frames
+        discard = reshape(repmat(discardFrames(:), 1,params.dsFac)', 1,[]); %upsample the discard frames
         IM2sel(:,discard) = nan;     %throw away movement frames as above
     else %1 channel
         clear IM;

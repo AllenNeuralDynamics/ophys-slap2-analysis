@@ -23,7 +23,7 @@ function [F0] = algo1(Fin, denoiseWindow, hullWindow)
 %   extrapolated smooth F0
 T = size(Fin,1);
 hullWindow = min(hullWindow, floor(T/4));
-deltaDes = max(4, (denoiseWindow/4)); % a safe spacing for computing F0, to save compute time
+deltaDes = max(4, (denoiseWindow/6)); % a safe spacing for computing F0, to save compute time
 sampleTimes = round(linspace(1, T, ceil(T/deltaDes)+1));
 nSampsInHull = ceil(hullWindow/deltaDes);
 
@@ -51,7 +51,9 @@ for cix = 1:size(F0,2)
         if sum(~doubt)>2
                 F2(doubt) = nan;
         end
-        F2 = smoothdata(F2,1,'lowess', 2*ceil(nSampsInHull/2)+1, 'omitnan');
+        fill = smoothdata(F2,1,'movmean', 2*ceil(nSampsInHull/2)+1, 'omitnan');
+        F2(isnan(F2)) = fill(isnan(F2));
+        F2= smoothdata(F2,1,'movmean', 2*ceil(nSampsInHull/2)+1, 'omitnan');
         F0(:,cix) = interp1(sampleTimes,F2,1:T,"pchip");
 end
 F0 = reshape(F0, origsz);

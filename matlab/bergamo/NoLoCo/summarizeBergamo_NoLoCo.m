@@ -197,6 +197,7 @@ end
 exptSummary.E = E;
 exptSummary.fns = fns;
 exptSummary.dr = dr;
+exptSummary.params = params;
 
 %per-trial images
 exptSummary.originalActivityChannel = params.activityChannel;

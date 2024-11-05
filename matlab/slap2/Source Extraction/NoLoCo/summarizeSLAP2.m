@@ -31,6 +31,7 @@ fnsave = [savedr filesep 'Summary-' datestr(now, 'YYmmDD-HHMMSS') '.mat'];
 
 %confirm that all files exist for both DMDs
 nTrials = length(trialTable.trueTrialIx);
+nTrials = 8;
 keepTrials = true(nDMDs, nTrials);
 for trialIx = nTrials:-1:1
     for DMDix = 1:nDMDs

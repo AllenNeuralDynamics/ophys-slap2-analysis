@@ -13,6 +13,7 @@ switch fnName
         params.baselineWindow_Ca_s = 4;  tooltips.baselineWindow_Ca_s= 'timescale for calculating F0 in calcium channel, seconds';
         params.activityChannel = 2;      tooltips.activityChannel = 'the channel of the original tiff image that contains the glutamate signal';
         params.tau_s = 0.027;            tooltips.tau_s = 'decay time constant of glutamate signal';
+        params.maxSynapseDensity = 0.01; tooltips.maxSynapseDensity = 'maximum synapses per pixel';
     case 'summarize_NoLoCo'
         params.scope = 'SLAP2';          tooltips.scope = 'SLAP2 or bergamo';
         params.sigma_px = 1.33;          tooltips.sigma_px = 'Estimated radius of the PSF (gaussian sigma)';
@@ -24,6 +25,7 @@ switch fnName
         params.baselineWindow_Ca_s = 4;  tooltips.baselineWindow_Ca_s= 'timescale for calculating F0 in calcium channel, seconds';
         params.activityChannel = 2;      tooltips.activityChannel = 'the channel of the original tiff image that contains the glutamate signal';
         params.tau_s = 0.027;            tooltips.tau_s = 'decay time constant of glutamate signal';
+        params.maxSynapseDensity = 0.01; tooltips.maxSynapseDensity = 'maximum synapses per pixel';
     case 'summarizeSLAP2'
         params.tau_s = 0.05;            tooltips.tau_s = 'decay time constant of glutamate signal';
         params.analyzeHz = 200; %frame rate used for analysis
