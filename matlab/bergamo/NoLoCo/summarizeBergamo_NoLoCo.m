@@ -2,6 +2,9 @@ function summarizeBergamo_NoLoCo(fns, dr, paramsIn)
 
 %PARAMETER SETTING
 if nargin>2
+    if ischar(paramsIn)  % Parse JSON String to Structure
+        paramsIn = jsondecode(paramsIn);
+    end
     params = setParams('summarizeBergamo_NoLoCo', paramsIn);
 else
     params = setParams('summarizeBergamo_NoLoCo');
@@ -151,6 +154,9 @@ pp = actIM; pp(~pIM) = 0; pp(pp<threshP) = 0;
 sz = size(pp);
 k = length(sources.R);
 
+% begin ADDED
+if k>0 
+% end ADDED
 %Generate dFsel and F0selDS; the data only in the selected region, aligned across movies
 selPix = false(sz(1:2));
 for sourceIx = k:-1:1
@@ -182,6 +188,7 @@ dFsel = cell2mat(dFsel); %collapse into an array
 clear rawIMs
 
 %extract sources from the downsampled movies
+
 [W0,~] = extractSourcesLoRes(dFsel, sources, selPix, params);
 
 %for each file, process the high res data
@@ -195,6 +202,9 @@ end
 
 %prepare file for saving
 exptSummary.E = E;
+% begin ADDED
+end
+% end ADDED
 exptSummary.fns = fns;
 exptSummary.dr = dr;
 exptSummary.params = params;
