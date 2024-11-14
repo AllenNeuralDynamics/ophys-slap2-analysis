@@ -70,11 +70,13 @@ for fix = 1:numel(fns)
 
     [Ad, ~, ~] = networkScanImageTiffReader(fullfile(dr,fn));
     [nRow, nCol, ~] = size(Ad);
-    disp([num2str(size(Ad,3)) ' frames read']);
 
     Ad = reshape(Ad, size(Ad,1), size(Ad,2), aData.numChannels, []);
     IM = reshape(Ad(:,:,end,:),[],size(Ad,4));
+    disp([num2str(size(Ad,4)) ' frames read']);
     clear Ad;
+
+    frameClkTrue = frameClkTrue(1:min(length(frameClkTrue),size(IM,2)));
 
     th = graythresh((aData.recNegErr-min(aData.recNegErr)) ./ (max(aData.recNegErr)-min(aData.recNegErr))) .* (max(aData.recNegErr)-min(aData.recNegErr)) + min(aData.recNegErr);
     dsFac = floor(length(aData.motionC) / length(aData.motionDSc));

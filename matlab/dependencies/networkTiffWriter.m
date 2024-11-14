@@ -3,8 +3,8 @@ function networkTiffWriter(mat, fnwrite, pixelscale, localDr)
 [dr, name, ext] = fileparts(fnwrite);
 
 writeDr = dr;
-
-if all(fnwrite(1:2) == 'Z:') || all(fnwrite(1:2) == '\\')
+isRemote = ~any(strcmpi(writeDr(1:2), {'C:', 'D:','E:', 'F:'}));
+if isRemote
     if ~exist('localDr', 'var'); localDr = 'C:\temp'; end % 'F:\tmp_tiffIO'; end
   
     writeDr = localDr;
@@ -19,7 +19,7 @@ end
 
 fTIF.close;
 
-if all(fnwrite(1:2) == 'Z:') || all(fnwrite(1:2) == '\\')
+if isRemote
     try
         copyfile(fullfile(writeDr, [name ext]),dr);
         delete(fullfile(writeDr, [name ext]));

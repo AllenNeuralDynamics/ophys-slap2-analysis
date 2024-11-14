@@ -142,6 +142,11 @@ for f_ix = 1:length(fns)
     recNegErr = nan(1,nDSframes);
     [viewR, viewC] = ndgrid((1:(sz(1)+2*maxshift))-maxshift, (1:(sz(2)+2*maxshift))-maxshift); %view matrices for interpolation
 
+    %for spatial downsampling, used to calculate alignment quality and for quicker visualization
+    dsTimes = 2;
+    dsSz = floor(size(template)./(2^dsTimes));
+    A_ds = nan([dsSz nDSframes]);
+
     disp('Registering:');
     for DSframe = 1:nDSframes
         readFrames = (DSframe-1)*(dsFac) + (1:(dsFac));
@@ -191,12 +196,20 @@ for f_ix = 1:length(fns)
         if abs(motionDSr(DSframe))<maxshift && abs(motionDSc(DSframe))<maxshift
             A = interp2(1:sz(2), 1:sz(1), M,viewC+motionDSc(DSframe), viewR+motionDSr(DSframe), 'linear', nan);
             % sel = ~isnan(A);
+            
+            %downsample in space and save, we will compute error statistics
+            %from the downsampled data
+            dsTmp = A;
+            for dsIx = 1:dsTimes
+                dsTmp = dsTmp(1:2:2*floor(end/2), 1:2:2*floor(end/2)) + dsTmp(1:2:2*floor(end/2), 2:2:2*floor(end/2)) + dsTmp(2:2:2*floor(end/2), 1:2:2*floor(end/2)) + dsTmp(2:2:2*floor(end/2), 2:2:2*floor(end/2));
+            end
+            A_ds(:,:,DSframe) = dsTmp;
 
-            Asmooth = imgaussfilt(A,1);
-
-            selCorr = ~(isnan(Asmooth) | isnan(Ttmp));
-            aRankCorr(DSframe) = corr(Asmooth(selCorr), Ttmp(selCorr), 'type', 'Spearman');
-            recNegErr(DSframe) = mean(min(0, Asmooth(selCorr) .* mean(Ttmp(selCorr)) ./ mean(Asmooth(selCorr)) - Ttmp(selCorr)).^2);
+            % Asmooth = imgaussfilt(A,1);
+            % 
+            % selCorr = ~(isnan(Asmooth) | isnan(Ttmp));
+            % aRankCorr(DSframe) = corr(Asmooth(selCorr), Ttmp(selCorr), 'type', 'Spearman');
+            % recNegErr(DSframe) = mean(min(0, Asmooth(selCorr) .* mean(Ttmp(selCorr)) ./ mean(Asmooth(selCorr)) - Ttmp(selCorr)).^2);
             
             templateFull = sum(cat(3,templateFull .* templateCt, A),3,"omitnan");
             templateCt = templateCt + ~isnan(A);
@@ -210,6 +223,20 @@ for f_ix = 1:length(fns)
             motionDSr(DSframe) = initR;
             motionDSc(DSframe) = initC;
         end
+    end
+
+    %compute alignemnt error stats
+    recNegErr = nan(1,nDSframes);
+    nChunks = ceil(nDSframes./800);
+    chunkEdges = round(linspace(1, nDSframes+1, nChunks));
+    for chunkIx = 1:length(chunkEdges)-1
+        t_ixs = chunkEdges(chunkIx):chunkEdges(chunkIx+1)-1;
+        template = median(A_ds(:,:,t_ixs), 3, 'omitmissing');
+        nanFrac = mean(isnan(A_ds(:,:,t_ixs)), 3);
+        template(nanFrac>0.2) = nan;
+        template = repmat(template, 1,1,length(t_ixs));
+        template(isnan(A_ds(:,:,t_ixs))) = nan;
+        recNegErr(1,t_ixs) = squeeze(mean((max(0, template-A_ds(:,:,t_ixs))), [1 2], 'omitnan')./mean(max(0,template, 'includenan'), [1 2], 'omitnan'));
     end
 
     %upsample the shifts and compute a tighter field of view
@@ -329,12 +356,13 @@ for f_ix = 1:length(fns)
     %save alignment metadata
     aData.numChannels = numChannels;
     aData.frametime = frametime;
+    aData.alignHz = 1/frametime/dsFac;
     aData.motionC =  motionC;
     aData.motionR = motionR;
     aData.motionDSc = motionDSc;
     aData.motionDSr = motionDSr;
-    aData.aError = aError;
-    aData.aRankCorr = aRankCorr;
+    %aData.aError = aError;
+    %aData.aRankCorr = aRankCorr;
     aData.recNegErr = recNegErr;
     
     save([fnstem '_ALIGNMENTDATA.mat'], 'aData');

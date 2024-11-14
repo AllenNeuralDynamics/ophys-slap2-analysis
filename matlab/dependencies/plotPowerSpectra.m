@@ -25,12 +25,12 @@ for i = 1:N
     P1 = P2(1:T/2);
     P1(2:end-1) = 2*P1(2:end-1);
     % Normalize the power spectrum
-    % P1_normalized = P1 / max(P1);
+    P1_normalized = P1 / max(P1);
     % Store the normalized power spectrum in the matrix
-    % powerSpectra(:,i) = P1_normalized;
-    powerSpectra(:,i) = P1;
+    powerSpectra(:,i) = P1_normalized;
+    % powerSpectra(:,i) = P1;
     % Plot the normalized power spectrum
-    plot(f, P1, 'DisplayName', ['Trace ' num2str(i)], 'Color',[colors(i,:), 0.5]);
+    plot(f, P1_normalized, 'DisplayName', ['Trace ' num2str(i)], 'Color',[colors(i,:), 0.5]);
 end
 hold off; % No more plots to add
 title('Power Spectra of Time Series');

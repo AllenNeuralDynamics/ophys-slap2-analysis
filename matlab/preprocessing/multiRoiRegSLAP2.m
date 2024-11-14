@@ -1,21 +1,20 @@
-function multiRoiRegBCI(dr, overwriteExisting)
+function multiRoiRegSLAP2(fullPathToTrialTable, paramsIn)
 
 if ~nargin
-    dr = uigetdir;
+    [fn, dr] = uigetfile('*trialTable*.mat');
+else
+    [dr, fn, ext] = fileparts(fullPathToTrialTable); fn = [fn ext]; 
 end
-if nargin<2
-    overwriteExisting = false; %by default, don't repeat alignment for files that are already processed
+
+%PARAMETER SETTING
+if nargin>1
+    params = setParams('multiRoiRegSLAP2', paramsIn);
+else
+    params = setParams('multiRoiRegSLAP2');
 end
     
 %load the trial Table, which sets correspondences between the two DMDs
-load([dr filesep 'trialTable.mat'], 'trialTable');
-alignHz = 80; %we will align data at this timescale, Hz
-
-aData.alignHz = alignHz;
-aData.maxshift = 50;
-aData.clipShift = 5;%the maximum allowable shift per frame
-aData.alpha = 0.005; %exponential time constant for template
-
+load([dr filesep fn], 'trialTable');
 
 %set up parallelization
 p = gcp('nocreate'); % If no pool, do not create new one.
@@ -24,31 +23,43 @@ if isempty(p)
 else
     poolsize = p.NumWorkers;
 end
-nWorkers = 24;
-if poolsize~=nWorkers
+nWorkers = min(params.nWorkers, numel(trialTable.filename));
+if poolsize<nWorkers
     delete(gcp('nocreate'));
-    if nWorkers<15
-        warning('You are using few parallel workers! adjust this in summarizeBCI.m');
+    if params.nWorkers<15
+        warning('You are using few parallel workers!');
     end
-    disp(['Parallel workers:' int2str(nWorkers)])
     parpool('processes',nWorkers); %limit the number of workers to avoid running out of RAM %4-30-24, lowering processes again to prevent another error (18 --> 15)
 end
-parfor f_ix = 1:length(trialTable.trueTrialIx)
-    fnWrite = ['E' int2str(trialTable.epoch(f_ix)) 'T' int2str(f_ix) 'DMD1'];
-    alignAsync(dr, trialTable.DMD1filename{f_ix}, fnWrite, trialTable.DMD1firstLine(f_ix), trialTable.DMD1lastLine(f_ix), aData, overwriteExisting);
-    fnWrite = ['E' int2str(trialTable.epoch(f_ix)) 'T' int2str(f_ix) 'DMD2'];
-    alignAsync(dr, trialTable.DMD2filename{f_ix}, fnWrite, trialTable.DMD2firstLine(f_ix), trialTable.DMD2lastLine(f_ix), aData, overwriteExisting);
+nDMDs = size(trialTable.filename,1);
+[dixs,fixs] = ndgrid(1:nDMDs,1:length(trialTable.trueTrialIx));
+fnRegDS = cell(nDMDs,length(trialTable.trueTrialIx));
+fnAdata = cell(nDMDs,length(trialTable.trueTrialIx));
+parfor p_ix = 1:numel(fixs)
+    f_ix = fixs(p_ix); DMD_ix = dixs(p_ix);
+    [fnRegDS{p_ix}, fnAdata{p_ix}]= alignAsync(dr, trialTable, params, f_ix, DMD_ix);
 end
+trialTable.fnRegDS = fnRegDS;
+trialTable.fnAdata = fnAdata;
+trialTable.alignParams = params;
+save([dr filesep fn], "trialTable")
 
 disp('done multiRoiRegistration.')
 end
 
-function alignAsync(dr, fn, fnW, firstLine, lastLine, aData, overwriteExisting)
+function [fnwrite, fnAdata] = alignAsync(dr, trialTable, params, f_ix, DMD_ix);
+
+fn = trialTable.filename{DMD_ix,f_ix};
+fnW = ['E' int2str(trialTable.epoch(f_ix)) 'T' int2str(f_ix) 'DMD' int2str(DMD_ix)];
+firstLine = trialTable.firstLine(DMD_ix,f_ix);
+lastLine = trialTable.lastLine(DMD_ix, f_ix);
+aData = params;
+
 disp(['Aligning: ' [dr filesep fn]])
     fnwrite = [dr filesep fnW '_REGISTERED_DOWNSAMPLED-' int2str(aData.alignHz) 'Hz.tif'];
     fnAdata = [dr filesep fnW '_ALIGNMENTDATA.mat'];
 
-    if ~overwriteExisting && exist(fnAdata, 'file') && exist(fnwrite, 'file')
+    if ~params.overwriteExisting && exist(fnAdata, 'file') && exist(fnwrite, 'file')
         disp([fn ' is already aligned; skipping' newline 'To force realign, pass TRUE as second argument']);
         return
     end
@@ -199,18 +210,20 @@ disp(['Aligning: ' [dr filesep fn]])
 
     fTIF.close;
 
-    %
+    %Compute alignment error
+    offset = 10;
     recNegErr = nan(1,nDSframes);
-    nChunks = ceil(nDSframes./800);
+    nChunks = ceil(nDSframes./(aData.alignHz*10)); %align 10 seconds at a time
     chunkEdges = round(linspace(1, nDSframes+1, nChunks));
     for chunkIx = 1:length(chunkEdges)-1
         t_ixs = chunkEdges(chunkIx):chunkEdges(chunkIx+1)-1;
         template = median(A_ds(:,:,t_ixs), 3, 'omitmissing');
         nanFrac = mean(isnan(A_ds(:,:,t_ixs)), 3);
         template(nanFrac>0.2) = nan;
+        template_gamma = sqrt(max(0,template)+offset);
         template = repmat(template, 1,1,length(t_ixs));
         template(isnan(A_ds(:,:,t_ixs))) = nan;
-        recNegErr(1,t_ixs) = squeeze(mean((max(0, template-A_ds(:,:,t_ixs))), [1 2], 'omitnan')./mean(max(0,template, 'includenan'), [1 2], 'omitnan'));
+        recNegErr(1,t_ixs) = sqrt(squeeze(mean((max(0, (template-A_ds(:,:,t_ixs))./template_gamma).^2), [1 2], 'omitnan')./mean(max(0,(template./template_gamma).^2, 'includenan'), [1 2], 'omitnan')));
     end
 
     if std(motionDSc)>1.5 || std(motionDSr)>1.5

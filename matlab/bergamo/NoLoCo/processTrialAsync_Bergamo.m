@@ -1,4 +1,4 @@
-function exptSummary = processTrialAsync_Bergamo(dr, fnRaw, ~, ~, W0, F0selDS, selPix, discardFrames, ~, ~, motOutput, ~, params)
+function exptSummary = processTrialAsync_Bergamo(dr, fnRaw, ~, ~, W0, F0selDS, selPix, discardFrames, ~, ~, motOutput, ~, params, BG)
     fn = fnRaw;
     activityChannel = params.activityChannel;
     numChannels = params.numChannels;
@@ -8,7 +8,7 @@ function exptSummary = processTrialAsync_Bergamo(dr, fnRaw, ~, ~, W0, F0selDS, s
 
     %load the high time resolution tiff
     fn = fnRaw;
-    [IM, desc, meta] = networkScanImageTiffReader([dr filesep fn]);
+    [IM, ~, ~] = networkScanImageTiffReader([dr filesep fn]);
     IM = double(IM);
 
     selPx2D = any(selPix,3);
@@ -20,6 +20,9 @@ function exptSummary = processTrialAsync_Bergamo(dr, fnRaw, ~, ~, W0, F0selDS, s
     if activityChannel>1
         IM = IM(:,:,[activityChannel:end, 1:activityChannel-1],:);
         disp('Reordering channels for analysis!')
+    end
+    for ch = 1:numChannels
+        IM(:,:,ch,:) = IM(:,:,ch,:)-(BG(ch)./params.dsFac);
     end
 
     IM1 = squeeze(IM(:,:,1,:));
@@ -53,11 +56,21 @@ function exptSummary = processTrialAsync_Bergamo(dr, fnRaw, ~, ~, W0, F0selDS, s
     %least squares solve the match filtered movie
     H0 = W\IMselFilt;
     
+    %Frames where more than 25% of pixels in a source are nan
+    nanFramesH = false(size(H0));
+    for sourceIx = 1:size(H0,1)
+        support = W(:,sourceIx)>0;
+        nanFramesH(sourceIx,:) = mean(selNans(support,:)) > 0.25;
+    end
+    nanFramesH(:,end+(-floor(params.tau_full):0)) = 1;
+    H0(nanFramesH) = nan;
+    nanFramesH = isnan(H0);
+
     %fit F0
-    f0 = W\F0sel;
+    f0 = (W./max(W,[],1))'*F0sel;  %f0 = W\F0sel;
     F0_H = computeF0(H0', ceil(params.denoiseWindow_s*params.analyzeHz), ceil(params.baselineWindow_Glu_s*params.analyzeHz), 1)';
     H = H0-F0_H;
-    f0 = f0+F0_H;
+    f0 = f0+(F0_H.*sum(W,1)');
 
     Hsub = 3*std(H,0,2, 'omitmissing');
     H = H+Hsub;
@@ -65,15 +78,6 @@ function exptSummary = processTrialAsync_Bergamo(dr, fnRaw, ~, ~, W0, F0selDS, s
     Wfull = nan([sz(1)*sz(2) size(W,2)]);
     Wfull(any(selPix,3),:) = W;
     Wfull = reshape(Wfull, sz(1),sz(2), []);
-
-    %Frames where more than 25% of pixels in a source are nan
-    nanFramesH = false(size(H));
-    for sourceIx = 1:size(H,1)
-        support = W(:,sourceIx)>0;
-        nanFramesH(sourceIx,:) = mean(selNans(support,:)) > 0.25;
-    end
-    nanFramesH(:,end+(-floor(params.tau_full):0)) = 1;
-    deconvWeights = 1-double(nanFramesH);
 
     %deconvolve out matched filter we applied earlier
     kernel = [zeros(1,ceil(8*params.tau_full)) exp(-(0:ceil(8*params.tau_full))/params.tau_full)];
@@ -84,6 +88,8 @@ function exptSummary = processTrialAsync_Bergamo(dr, fnRaw, ~, ~, W0, F0selDS, s
     
     %perform deconvolution, filling in NaNs with reconstructed values every
     %few iterations:
+    deconvWeights = 1-double(nanFramesH);
+    H(nanFramesH) = 0; %the value here shouldn't matter because of deconvWeights
     J = deconvlucy({H},doubleKernel, 20,[], deconvWeights);
     Js = deconvlucy({H},fKernel, 10,[],deconvWeights);
     for iter = 1:3
@@ -109,7 +115,7 @@ function exptSummary = processTrialAsync_Bergamo(dr, fnRaw, ~, ~, W0, F0selDS, s
     % F0mean = repmat(mean(F0sel,2, 'omitnan'),1,size(F0sel,2));
     % F0sel(~isfinite(F0sel)) = max(0, F0mean(~isfinite(F0sel)));
     % F0= (W./max(W,[],1))' *F0sel + sum(W,1)'.*F0_H;%(W./max(W,[],1))' *F0sel;
-    F0 = max(f0,0) + median(f0(f0>0))/4; %some regularization and ensure F0 is positive
+    F0 = max(f0,0, 'includenan') + median(f0,2, 'omitmissing')/4; %some regularization and ensure F0 is positive
     F0(setNan) = nan;
 
     %NaN out invalid data
@@ -157,7 +163,7 @@ end
 function [IMsel, IMselRaw, F0,  W, selNans] = prepareNMFproblem(IMsel, W0, F0selDS, params)
     F0 = nan(size(IMsel));
     for rix = 1:size(F0selDS, 1)
-        F0(rix,:) = interp(F0selDS(rix,:), params.dsFac)./params.dsFac;
+        F0(rix,:) = interp(F0selDS(rix,:), params.dsFac);
     end
     IMsel = IMsel - F0;
     selNans = isnan(IMsel);

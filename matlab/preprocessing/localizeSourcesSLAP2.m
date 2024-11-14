@@ -3,10 +3,10 @@ function [summaryEroded, P] = localizeSourcesSLAP2(IM, aData, params, doPlot)
 %IM:        3D recording, X x Y x Time
 %aData:     alignment metadata
 nTimePoints = size(IM,3);
-tau = params.tau_s./(params.frametime*params.dsFac); %time constant in frames
+tau = params.tau_s.*params.alignHz; %time constant in frames
 params.tau_frames = tau;
 sigma = params.sigma_px; %space constant in pixels
-baselineWindow = ceil(params.baselineWindow_Glu_s/(params.frametime*params.dsFac));
+baselineWindow = ceil(params.baselineWindow_Glu_s.*params.alignHz);
 nans = isnan(IM);
 IMavg = mean(IM,3, 'omitmissing');
 IMgamma = sqrt(max(0,IMavg));
@@ -19,10 +19,9 @@ if nargin<4
 end
 
 %initialize filtered image
-IMf = IM;
+IMf = IM; clear IM;
 IMf(repmat(~valid, 1, 1, nTimePoints)) = nan;
 nans = isnan(IMf);
-clear IM
 
 %fill in missing values
 IMf= reshape(IMf, sz(1)*sz(2), []);
@@ -77,9 +76,10 @@ IMf = max(min(IMf, 6*stdIM, 'includemissing'), -6*stdIM, 'includemissing');
 summary = skewness(IMf(:,:, 1:end-3*ceil(tau)), 1,3).*IMgamma; %remove the last few points, these can be outliers
 
 summaryEroded = summary;
-% summaryEroded(isnan(summaryEroded)) = median(summaryEroded,'all', 'omitmissing');
-% summaryEroded = summaryEroded - imgaussfilt(summaryEroded, 5*[sigma sigma]);
-% summaryEroded(~valid) = nan;
+summaryEroded(~valid) = nan;
+summaryEroded(isnan(summaryEroded)) = median(summaryEroded,'all', 'omitmissing');
+summaryEroded = summaryEroded - imgaussfilt(summaryEroded, 15*[sigma sigma]);
+summaryEroded(~valid) = nan;
 %summaryEroded(imdilate(isnan(summary), ones(3, 5))) = nan; %this removes odd phenomena at edges due to alignment, could probably be fixed by treating nans appropriately
 
 %find local maxima
@@ -88,7 +88,16 @@ peaks = summaryEroded == ordfilt2(summaryEroded, 9, ones(3)); %> circshift(summa
 p = summaryEroded(peaks);
 sortedP = sort(p, 'descend');
 totalPix = sum(~isnan(summaryEroded(:)));
-threshP = 1.5*sortedP(min(end,ceil(totalPix * params.maxSynapseDensity * (1-exp(-nTimePoints*params.frametime*params.dsFac/10)))));
+
+if totalPix<10
+    P.row = [];
+    P.col = [];
+    P.val = [];
+    P.peakIM = zeros(size(summaryEroded));
+    return
+end
+
+threshP = 1.5*sortedP(min(end,ceil(totalPix * params.maxSynapseDensity * (1-exp(-nTimePoints./params.alignHz./10)))));
 pp = summaryEroded; pp(~peaks) = 0; pp(pp<threshP) = 0;
 [rrr,ccc,vvv] = find(pp);
 

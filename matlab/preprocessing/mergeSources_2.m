@@ -19,6 +19,7 @@ k = size(W,2); %number of sources
 
 %discard low SNR sources
 %compare variance explained to residual variance
+SNR = nan(1,k);
 for sourceIx = k:-1:1
     selPx = W(:,sourceIx)>0;
     %D = resid(selPx, :);

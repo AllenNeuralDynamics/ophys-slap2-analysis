@@ -61,12 +61,12 @@ function behaviorData = extract_behavior_from_harp(dr)
     moveOnly_motor = readtable([moveOnly registers{5}]);
     moveOnly_loadCell = read_harp_bin([moveOnly registers{6}]);  
     
-    moveOnly_array = trialize_data(moveOnly_startTriggers, moveOnly_stopTriggers, moveOnly_loadCell, moveOnly_adc, moveOnly_motor, moveOnly_lickT);
+    moveOnly_array = trialize_data(moveOnly_startTriggers, moveOnly_stopTriggers, moveOnly_loadCell, moveOnly_adc, moveOnly_motor, moveOnly_lickT, moveOnly_goCueT, moveOnly_rewCueT);
     
     %BCIs
     BCI_audio = read_harp_bin([BCIon registers{1}]);
-    BCI_goCueT = moveOnly_audio.Seconds(BCI_audio.Values==goCue);
-    BCI_rewCueT = moveOnly_audio.Seconds(BCI_audio.Values==rewardCue);
+    BCI_goCueT = BCI_audio.Seconds(BCI_audio.Values==goCue);
+    BCI_rewCueT = BCI_audio.Seconds(BCI_audio.Values==rewardCue);
     
     BCI_handshake = read_harp_bin([BCIon registers{2}]);
     BCI_startTriggers = BCI_handshake.Seconds(BCI_handshake.Values == startPin);
@@ -81,7 +81,7 @@ function behaviorData = extract_behavior_from_harp(dr)
     BCI_motor = readtable([BCIon registers{5}]);
     BCI_loadCell = read_harp_bin([BCIon registers{6}]);
     
-    BCI_array = trialize_data(BCI_startTriggers, BCI_stopTriggers, BCI_loadCell, BCI_adc, BCI_motor, BCI_lickT);
+    BCI_array = trialize_data(BCI_startTriggers, BCI_stopTriggers, BCI_loadCell, BCI_adc, BCI_motor, BCI_lickT, BCI_goCueT, BCI_rewCueT);
     
     
     behaviorData = vertcat(moveOnly_array, BCI_array);  

@@ -10,10 +10,14 @@ parfor idx = 1:length(dataDirs)
     disp(['Running directory ' fullfile(dFolder,dName)])
 
     try
-        data = load(fullfile(dFolder,dName,[dName '_DENOISED_EXPTSUMMARY.mat']));
+        data = load(fullfile(dFolder,dName,[dName '_EXPTSUMMARY.mat']));
     catch
-        disp(['Not processed: ' fullfile(dFolder,dName)]);
-        continue;
+        try
+            data = load(fullfile(dFolder,dName,[dName '_DENOISED_EXPTSUMMARY.mat']));
+        catch
+            disp(['Not processed: ' fullfile(dFolder,dName)]);
+            continue;
+        end
     end
 
     exptSummary = data.exptSummary;
@@ -35,7 +39,7 @@ parfor idx = 1:length(dataDirs)
         end
     end
 
-    savefunc(fullfile(dFolder,dName,[dName '_DENOISED_EXPTSUMMARY.mat']),exptSummary);
+    savefunc(fullfile(dFolder,dName,[dName '_EXPTSUMMARY.mat']),exptSummary);
 end
 
 %%

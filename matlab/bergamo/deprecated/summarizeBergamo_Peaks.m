@@ -93,9 +93,15 @@ for trialIx = length(fns):-1:1
     %discard motion frames
     % tmp = aData.aRankCorr(:)-smoothExp(aData.aRankCorr(:),'movmedian', ceil(2/(aData.frametime*aData.dsFac))); %-smoothdata(aData.aRankCorr,2, 'movmedian', ceil(2/aData.frametime));
     % discardFrames{trialIx} = imdilate(tmp<-(4*std(tmp)), ones(1,5));
-    tmp = aData.aRankCorr(:)-smoothExp(aData.aRankCorr(:),'movmedian', ceil(10/(aData.frametime*aData.dsFac)));
-    filtTmp = smoothExp(tmp, 'movmean',ceil(.2/(aData.frametime*aData.dsFac)));
-    discardFrames{trialIx} = imdilate(filtTmp<-(4*std(filtTmp)), ones(1,5));
+    tmp = aData.recNegErr(:)- median(aData.recNegErr(:)); %smoothExp(aData.recNegErr(:),'movmedian', ceil(2/(aData.frametime*aData.dsFac))); %-smoothdata(aData.aRankCorrDS,2, 'movmedian', ceil(2/aData.frametime));
+    tmp = tmp./(median(aData.recNegErr(:)) - prctile(aData.recNegErr(:),1)); 
+    thresh = 3; %decrease thresh to be more stringent on motion correction
+    window = 2*ceil(0.1/params.frametime)+1;% a window in time to censor aronud motion events, ~0.2 seconds;
+    discardFrames{trialIx} = imclose(imdilate(tmp>thresh, ones(window,1)) | (tmp>(thresh/2) & imdilate(tmp>thresh, ones(2*window+1,1))), ones(window,1));
+
+    % tmp = aData.aRankCorr(:)-smoothExp(aData.aRankCorr(:),'movmedian', ceil(10/(aData.frametime*aData.dsFac)));
+    % filtTmp = smoothExp(tmp, 'movmean',ceil(.2/(aData.frametime*aData.dsFac)));
+    % discardFrames{trialIx} = imdilate(filtTmp<-(4*std(filtTmp)), ones(1,5));
     rawIMs{trialIx} = squeeze(IM(:,:,1,:));
     rawIMs{trialIx}(:,:,discardFrames{trialIx}) = nan;
     if numChannels==2

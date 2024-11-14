@@ -1,4 +1,4 @@
-function trialTable = buildTrialTable(dr)
+function trialTable = buildTrialTableSLAP2(dr)
 %This function organizes multi-trial recordings and reference images as a first step in the SLAP2 data processing
 %pipeline
 
@@ -17,11 +17,11 @@ unpickedfiles = dir([dr filesep '*.dat']);
 
 epoch = 0;
 while ~isempty(unpickedfiles)
-    epoch = epoch+1;
     [indx,tf] = listdlg('ListString',{unpickedfiles.name}, 'PromptString',['Select files for EPOCH ' int2str(epoch)]);
     if ~tf
-        return
+        break
     end
+    epoch = epoch+1;
     epochfiles{epoch} = unpickedfiles(indx);
     unpickedfiles(indx) = [];
 end
@@ -31,8 +31,7 @@ end
 DMDixs = [1 2];
 %find the files within the entire folder structure named REFERENCE
 for DMDix = DMDixs
-    list = dir([dr '/*/*DMD' int2str(DMDix) '-REFERENCE*']);
-    %old format, two reference files
+    list = dir([dr filesep '**' filesep '*DMD' int2str(DMDix) '*-REFERENCE*']);
     switch length(list)
     case 0
         error(['Could not find reference image within folder: ' dr])
@@ -61,12 +60,13 @@ for DMDix = DMDixs
         refStack{DMDix}.Zs = Zs;
         refStack{DMDix}.dmdPixel2SampleTransform = jj.dmdPixel2SampleTransform;
 
-    case 2
-        for cix = 1:2
-            DMD1refFn = fullfile(list(cix).folder, list(cix).name);
-            A = ScanImageTiffReader(DMD1refFn);
-            refStack{DMDix}.IM(:,:,:,cix) = A.data;
-        end
+    case 2  %old format, two reference files
+        error('Too many reference stacks found in the specified directory!');
+        % for cix = 1:2
+        %     DMD1refFn = fullfile(list(cix).folder, list(cix).name);
+        %     A = ScanImageTiffReader(DMD1refFn);
+        %     refStack{DMDix}.IM(:,:,:,cix) = A.data;
+        % end
     otherwise
         error('Too many reference stacks found in the specified directory!');
     end
@@ -75,12 +75,9 @@ for DMDix = DMDixs
 end
 trialTable.refStack = refStack; clear refStack;
 
-trialTable.DMD1filename = {};
-trialTable.DMD1firstLine = [];
-trialTable.DMD1lastLine = [];
-trialTable.DMD2filename = {};
-trialTable.DMD2firstLine = [];
-trialTable.DMD2lastLine = [];
+trialTable.filename = {};
+trialTable.firstLine = [];
+trialTable.lastLine = [];
 trialTable.trialEndTimeFromPC = [];
 trialTable.trialStartTimeInferred = [];
 
@@ -119,12 +116,12 @@ for eIx = 1:epoch %for each epoch
 
         nLines = min(cumLines1(1), cumLines2(1));
         trueTrialIx = trueTrialIx+1;
-        trialTable.DMD1filename{trueTrialIx} = DMD1files(lastDMD1fIx+1).name;
-        trialTable.DMD2filename{trueTrialIx} = DMD2files(lastDMD2fIx+1).name;
-        trialTable.DMD1firstLine(trueTrialIx) = accumLines(1)+1;
-        trialTable.DMD2firstLine(trueTrialIx) = accumLines(2)+1;
-        trialTable.DMD1lastLine(trueTrialIx) = accumLines(1)+nLines;
-        trialTable.DMD2lastLine(trueTrialIx) = accumLines(2)+nLines;
+        trialTable.filename{1,trueTrialIx} = DMD1files(lastDMD1fIx+1).name;
+        trialTable.filename{2,trueTrialIx} = DMD2files(lastDMD2fIx+1).name;
+        trialTable.firstLine(1,trueTrialIx) = accumLines(1)+1;
+        trialTable.firstLine(2,trueTrialIx) = accumLines(2)+1;
+        trialTable.lastLine(1,trueTrialIx) = accumLines(1)+nLines;
+        trialTable.lastLine(2,trueTrialIx) = accumLines(2)+nLines;
         trialTable.trueTrialIx(trueTrialIx) = trueTrialIx;
         trialTable.epoch(trueTrialIx) = eIx;
 
@@ -154,7 +151,6 @@ for eIx = 1:epoch %for each epoch
     end
 end
 
-%identify which plane of the 
 
 save([dr filesep 'trialTable'], 'trialTable');
 end

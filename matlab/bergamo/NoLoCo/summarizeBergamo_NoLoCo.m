@@ -56,10 +56,18 @@ for trialIx = nTrials:-1:1
         disp('Reordering channels for analysis!')
     end
 
+    % BG(trialIx,:) = squeeze(min(0,prctile(IM,10,[1 2 4]), 'includemissing'));
+    % for ch = 1:numChannels
+    %     IM(:,:,ch,:) = IM(:,:,ch,:)-BG(trialIx, ch);
+    % end
+    mIM= mean(IM,4, 'omitnan');
+    nanPx = repmat(mean(isnan(IM), [3 4])>params.nanThresh, 1,1,size(IM,3));
+    mIM(nanPx) = nan;
+
     meanIM(end:size(IM,1),:,:,:) = nan;
     meanIM(:, end:size(IM,2),:,:) = nan;
     meanIM(:,:,:,trialIx) = nan;
-    meanIM(1:size(IM,1),1:size(IM,2),:,trialIx) = mean(IM,4, 'omitnan');
+    meanIM(1:size(IM,1),1:size(IM,2),:,trialIx) = mIM;
 
     %load alignment data
     fnStemEnd = strfind(fn, '_REGISTERED') -1;
@@ -71,9 +79,15 @@ for trialIx = nTrials:-1:1
     params.alignHz = params.analyzeHz./params.dsFac;
 
     %discard motion frames
-    tmp = aData.aRankCorr(:)-smoothExp(aData.aRankCorr(:),'movmedian', ceil(10/(aData.frametime*aData.dsFac)));
-    filtTmp = smoothExp(tmp, 'movmean',ceil(.2/(aData.frametime*aData.dsFac)));
-    discardFrames{trialIx} = imdilate(filtTmp<-(4*std(filtTmp)), ones(1,5));
+    %tmp = aData.aRankCorr(:)-smoothExp(aData.aRankCorr(:),'movmedian', ceil(10/(aData.frametime*aData.dsFac)));
+    %filtTmp = smoothExp(tmp, 'movmean',ceil(.2/(aData.frametime*aData.dsFac)));
+    %discardFrames{trialIx} = imdilate(filtTmp<-(4*std(filtTmp)), ones(1,5));
+    tmp = aData.recNegErr(:)- medfilt1(aData.recNegErr(:), round(4*params.alignHz)); %smoothExp(aData.recNegErr(:),'movmedian', ceil(2/(aData.frametime*aData.dsFac))); %-smoothdata(aData.aRankCorrDS,2, 'movmedian', ceil(2/aData.frametime));
+    tmp = -tmp./(min(-0.005, prctile(tmp,5))); %normalize to the median-to-5th prctile interval, or 0.5% of intensity, whichever is larger
+    thresh = params.motionThresh;
+    window = 2*ceil(0.1/params.frametime/aData.dsFac)+1;% a window in time to censor aronud motion events, ~0.2 seconds;
+    discardFrames{trialIx} = imclose(imdilate(tmp>thresh, ones(window,1)) | (tmp>(thresh/2) & imdilate(tmp>thresh, ones(2*window+1,1))), ones(window,1));
+
     rawIMs{trialIx} = squeeze(IM(:,:,1,:));
     rawIMs{trialIx}(:,:,discardFrames{trialIx}) = nan;
     if numChannels==2
@@ -155,15 +169,33 @@ sz = size(pp);
 k = length(sources.R);
 
 % begin ADDED
-if k>0 
+if k>0
 % end ADDED
-%Generate dFsel and F0selDS; the data only in the selected region, aligned across movies
-selPix = false(sz(1:2));
-for sourceIx = k:-1:1
-    rr = max(1, round(sources.R(sourceIx)-params.dXY)):min(sz(1),  round(sources.R(sourceIx))+params.dXY);
-    cc = max(1, round(sources.C(sourceIx)-params.dXY)):min(sz(2),  round(sources.C(sourceIx))+params.dXY);
-    selPix(rr,cc,sourceIx) = true;
-end
+% %Generate dFsel and F0selDS; the data only in the selected region, aligned across movies
+% selPix = false(sz(1:2));
+% for sourceIx = k:-1:1
+%     rr = max(1, round(sources.R(sourceIx)-params.dXY)):min(sz(1),  round(sources.R(sourceIx))+params.dXY);
+%     cc = max(1, round(sources.C(sourceIx)-params.dXY)):min(sz(2),  round(sources.C(sourceIx))+params.dXY);
+%     selPix(rr,cc,sourceIx) = true;
+% end
+%%
+    %Generate IMsel; the data only in the selected region, aligned across movies
+    selPix = false([sz(1:2) k]);
+    for sourceIx = k:-1:1
+        rr = max(1, round(sources.R(sourceIx)-params.dXY)):min(sz(1),  round(sources.R(sourceIx))+params.dXY);
+        cc = max(1, round(sources.C(sourceIx)-params.dXY)):min(sz(2),  round(sources.C(sourceIx))+params.dXY);
+        selPix(rr,cc,sourceIx) = true;
+    end
+    pxAlwaysValid = mean(isnan(meanAligned(:,:,1,validTrials)),4)<params.nanThresh;
+    selPix = selPix & repmat(pxAlwaysValid, 1, 1, k); %ADJUST SELECTED PIXELS NOT TO INCLUDE POORLY MEASURED PIXELS
+
+    %prune any sources that got clipped by pixel selection process
+    keepSources = sum(selPix, [1 2])>5;
+    k = sum(keepSources, 'all');
+    sources.R = sources.R(keepSources);
+    sources.C = sources.C(keepSources);
+    selPix = selPix(:,:,keepSources);
+%%
 F0selDS = cell(nTrials,1); dFsel = cell(1,nTrials);
 for trialIx = 1:nTrials %parfor
     if any(validTrials==trialIx)
@@ -194,10 +226,25 @@ clear rawIMs
 %for each file, process the high res data
 params.tau_full=params.tau_s*params.analyzeHz;
 E = cell(nTrials,1);
-parfor trialIx = 1:nTrials
+for trialIx = 1:nTrials
     if any(validTrials==trialIx)
-        E{trialIx} = processTrialAsync_Bergamo(dr, fnRaw{trialIx}, [], [], W0, F0selDS{trialIx}, selPix, discardFrames{trialIx}, [], [], motOutput(:,trialIx), [], params);
+        E{trialIx} = processTrialAsync_Bergamo(dr, fnRaw{trialIx}, [], [], W0, F0selDS{trialIx}, selPix, discardFrames{trialIx}, [], [], motOutput(:,trialIx), [], params, 0); %BG(trialIx, :));
     end
+end
+
+% estimate noise
+for trialIx = 1:nTrials
+for nId = 1:size(E{trialIx}.dFFls,1)
+    for chId = 1:size(E{trialIx}.dFFls,3)
+        trace = E{trialIx}.dFFls(nId,:,chId);
+        nanFrac = mean(isnan(trace));
+        if nanFrac<0.9
+            E{trialIx}.noise_dFFls(nId,chId) = estimatenoise(trace(:));
+        else
+            E{trialIx}.noise_dFFls(nId,chId) = nan;
+        end
+    end
+end
 end
 
 %prepare file for saving
@@ -233,6 +280,7 @@ nSelPix = sum(anySel(:));
 %Temporal filter the movie
 tau = params.tau_s./(params.frametime*params.dsFac); %time constant in frames
 dFselTf = matchedExpFilter(dFsel, tau);
+
 selNans = imclose(isnan(dFselTf), ones(1, 2*ceil(params.denoiseWindow_s/params.frametime)+1));
 meanDF = repmat(mean(dFselTf,2, 'omitnan'), 1, size(dFsel,2));
 meanDF(isnan(meanDF)) = 0;

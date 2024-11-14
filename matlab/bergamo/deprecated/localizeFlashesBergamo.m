@@ -129,7 +129,7 @@ for rix = 1:length(tilestartsR)
         vals = vvv(selStats & selS);
         ptile = prctile(vals, [1 50]);
         vals = 3*(vals-ptile(2))./(ptile(2) - ptile(1));
-        thresh = ptile(2) + 2*(ptile(2) - ptile(1)); % threshold is 2*[98% confint], corresponding to an SNR of ~6
+        thresh = ptile(2) + 4*(ptile(2) - ptile(1)); % threshold is 2*[98% confint], corresponding to an SNR of ~6
         selTile = rrr>=tilestartsR(rix) & rrr<=tileendsR(rix)  & ccc>=tilestartsC(cix) & ccc<=tileendsC(cix) & vvv>thresh & selS; %the events within this tile that should be kept
         keep(selTile) = true;
         vNorm(selStats & selS) = max(vNorm(selStats & selS), vals);
