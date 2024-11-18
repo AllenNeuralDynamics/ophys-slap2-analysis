@@ -55,13 +55,13 @@ for Zix = numZs:-1:1
 end
 
 %straighten out the reference stack
-[IM, IMc] = straightenStack(refIM, IMc);
+IM = straightenStack(refIM, IMc); %removed IMc because we don't use that anymore
 
 %convert to 16 bit
 IM = max(0, IM- prctile(IM(:), 1));
-IMc = max(0, IMc- prctile(IMc(:), 1));
-IMc = IMc./max(IMc, [], 'all');
-IMc = uint16(IMc.*65000);
+% IMc = max(0, IMc- prctile(IMc(:), 1));
+% IMc = IMc./max(IMc, [], 'all');
+% IMc = uint16(IMc.*65000);
 
 %remap to full dynamic range; optional
 normalizeIntensity = false;
@@ -90,7 +90,7 @@ metadata1.setPixelsPhysicalSizeZ(pixelSizeZObj, 0);
 bfsave(squeeze(IM(:,:,1,:)), outputPathCh1, 'BigTiff', true, 'metadata', metadata1);
 bfsave(squeeze(IMc(:,:,1,:)), outputPathCh1corr, 'BigTiff', true);
 
-if size(IM,3) == 2
+if size(IM,3) > 1
     metadata2 = createMinimalOMEXMLMetadata(squeeze(IM(:,:,2,:)));
     metadata2.setPixelsPhysicalSizeX(pixelSizeObj, 0);
     metadata2.setPixelsPhysicalSizeY(pixelSizeObj, 0);

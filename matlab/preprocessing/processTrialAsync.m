@@ -204,10 +204,21 @@ exptSummary.F0(:,:,1) = F0;
 exptSummary.footprints = Wfull;
 exptSummary.discardFrames = discard;
 
-%populate dF/F
+
+%populate dF/F and noise estimation;
 fnames = fieldnames(exptSummary.dF);
 for fnix = 1:length(fnames)
-    exptSummary.dFF.(fnames{fnix}) = exptSummary.dF.(fnames{fnix})./exptSummary.F0;
+    tmpDF =exptSummary.dF.(fnames{fnix});
+    tmpDFF = tmpDF./exptSummary.F0;
+    exptSummary.dFF.(fnames{fnix}) = tmpDFF;
+    exptSummary.noiseEst.dF.(fnames{fnix}) = nan(size(tmpDF,1),1);
+    exptSummary.noiseEst.dFF.(fnames{fnix}) = nan(size(tmpDFF,1),1);
+    for sourceIx =1:size(tmpDF,1)
+        tmp = tmpDF(sourceIx, ~isnan(tmpDF(sourceIx,:)));
+        exptSummary.noiseEst.dF.(fnames{fnix})(sourceIx) = estimatenoise(tmp(1:ceil(params.tau_full):end));
+        tmp = tmpDFF(sourceIx, ~isnan(tmpDFF(sourceIx,:)));
+        exptSummary.noiseEst.dFF.(fnames{fnix})(sourceIx) = estimatenoise(tmp(1:ceil(params.tau_full):end));
+    end
 end
 
 %compute channel 2 signals for the automatic ROIs
