@@ -2,10 +2,22 @@ function [data, meta]= copyReadDeleteScanImageTiff(remotepath, localDir)
 if isempty(remotepath) %PASS EMPTY MATRIX TO INITIALIZE
     thisDir = fileparts(which('copyReadDeleteScanImageTiff'));
     if ~exist([thisDir filesep 'pathToFastDrive.mat'], 'file')
-        localDir = uigetdir('', 'Select a local directory to save temporary files, on your FASTEST local drive!');
-        if ~exist(localDir, 'dir')
-            warning('User canceled setting local directory. defaulting to C:/temp')
-            localDir = 'C:\temp\';
+        try
+            localDir = uigetdir('', 'Select a local directory to save temporary files, on your FASTEST local drive!');
+            if ~exist(localDir, 'dir')
+                warning('User canceled setting local directory. defaulting to C:/temp on Windows else /scratch')
+                if ispc
+                    localDir = 'C:\temp\';
+                else
+                    localDir = '/scratch';
+                end
+            end
+        catch
+            if ispc
+                localDir = 'C:\temp\';
+            else
+                localDir = '/scratch';
+            end
         end
         save([thisDir filesep 'pathToFastDrive.mat'], 'localDir');
     end
@@ -18,12 +30,24 @@ if nargin<2
     if exist([thisDir filesep 'pathToFastDrive.mat'], 'file')
         load([thisDir filesep 'pathToFastDrive.mat'], 'localDir');
     else
-        localDir = uigetdir('', 'Select a local directory to save temporary files, on your FASTEST local drive!');
-        if exist(localDir, 'dir')
-           save([thisDir filesep 'pathToFastDrive.mat'], 'localDir');
-        else
-            warning('User canceled setting local directory. defaulting to C:/temp')
-            localDir = 'C:\temp\';
+        try
+            localDir = uigetdir('', 'Select a local directory to save temporary files, on your FASTEST local drive!');
+            if exist(localDir, 'dir')
+               save([thisDir filesep 'pathToFastDrive.mat'], 'localDir');
+            else
+                warning('User canceled setting local directory. defaulting to C:/temp on Windows else /scratch')
+                if ispc
+                    localDir = 'C:\temp\';
+                else
+                    localDir = '/scratch';
+                end
+            end
+        catch
+            if ispc
+                localDir = 'C:\temp\';
+            else
+                localDir = '/scratch';
+            end
         end
     end
 end
@@ -36,11 +60,12 @@ randName = [int2str(round(1e10*rand+0.1)) '.tif'];
 localpath = [localDir  filesep   randName];
 disp(localpath)
 copyfile(remotepath, localpath);
-A = ScanImageTiffReader(localpath);
-data = A.data();
-if nargout>1
-    meta = A.metadata;
-end
-delete(A);
+% A = ScanImageTiffReader(localpath);
+% data = A.data();
+% if nargout>1
+%     meta = A.metadata;
+% end
+[data, desc, meta] = networkScanImageTiffReader(localpath);
+% delete(A);
 delete(localpath);
 end
