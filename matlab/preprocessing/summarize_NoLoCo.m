@@ -1,6 +1,9 @@
 function summarize_NoLoCo(dr_or_pathToTrialTable, paramsIn)
 %PARAMETER SETTING
 if nargin>1
+    if ischar(paramsIn)  % Parse JSON String to Structure
+        paramsIn = jsondecode(paramsIn);
+    end
     params = setParams('summarize_NoLoCo', paramsIn);
 else
     params = setParams('summarize_NoLoCo');
@@ -41,6 +44,11 @@ disp(['## SUMMARIZING' newline 'Folder:'])
 disp(dr)
 
 savedr = [dr filesep 'ExperimentSummary'];
+% on CodeOcean /data is read-only and we save to /results
+is_CodeOcean = ~(getenv("CO_CPUS") == "");
+if is_CodeOcean
+    savedr = strrep(savedr, '/data', '/results');
+end
 if ~exist(savedr, 'dir')
     mkdir(savedr);
 end
@@ -191,14 +199,19 @@ for DMDix = nDMDs:-1:1
     p = actIM(pIM);
     sortedP = sort(p, 'descend');
     totalPix = sum(~isnan(actIM(:)) & ~somaMask(:));
-    threshP = 2*sortedP(min(end, ceil(totalPix*params.maxSynapseDensity))); %maximum synapse density
-    pp = actIM; pp(~pIM) = 0; pp(pp<threshP) = 0;
-    [sources.R,sources.C,sources.V] = find(pp);
-    sz = size(pp);
-    k = length(sources.R);
+    if totalPix == 0
+        k = 0;
+    else
+        threshP = 2*sortedP(min(end, ceil(totalPix*params.maxSynapseDensity))); %maximum synapse density
+        pp = actIM; pp(~pIM) = 0; pp(pp<threshP) = 0;
+        [sources.R,sources.C,sources.V] = find(pp);
+        sz = size(pp);
+        k = length(sources.R);
+    end
     %strategy 2: use peaks
     %not implemented
 
+    if k>0
     %Generate IMsel; the data only in the selected region, aligned across movies
     selPix = false([sz(1:2) k]);
     for sourceIx = k:-1:1
@@ -246,6 +259,7 @@ for DMDix = nDMDs:-1:1
     end
     E = cell(nTrials,1);
     fns = trialTable.fnRaw(DMDix,:);
+    if size(W0, 2) > 0
     if strcmpi(params.microscope, 'SLAP2')
         %this step is not very memory-demanding for SLAP2; increase parallel workers
         newN = min(min(24,nWorkers*5), size(trialTable.filename,2));
@@ -268,11 +282,15 @@ for DMDix = nDMDs:-1:1
                 fnRaw = fns{trialIx};
                 E{trialIx} = processTrialAsync(dr, fnRaw, [], [], W0, F0selDS{trialIx}, selPix, discardFrames{trialIx}, alignData{trialIx}, mIM{trialIx}, motOutput(:,trialIx), roiData, params);
             end
+            end
         end
     end
 
     %per-trial images
     exptSummary.E(:,DMDix) = E; %experiment data
+    else
+    roiData =[];
+    end
     exptSummary.aData(:,DMDix) = alignData;
     exptSummary.userROIs{DMDix} = roiData;
     exptSummary.peaks{DMDix}= peaks;
