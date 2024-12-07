@@ -60,15 +60,45 @@ for DMDix = DMDixs
         refStack{DMDix}.Zs = Zs;
         refStack{DMDix}.dmdPixel2SampleTransform = jj.dmdPixel2SampleTransform;
 
-    case 2  %old format, two reference files
-        error('Too many reference stacks found in the specified directory!');
-        % for cix = 1:2
-        %     DMD1refFn = fullfile(list(cix).folder, list(cix).name);
-        %     A = ScanImageTiffReader(DMD1refFn);
-        %     refStack{DMDix}.IM(:,:,:,cix) = A.data;
-        % end
+    % case 2  %old format, two reference files
+    %     error('Too many reference stacks found in the specified directory!');
+    %     % for cix = 1:2
+    %     %     DMD1refFn = fullfile(list(cix).folder, list(cix).name);
+    %     %     A = ScanImageTiffReader(DMD1refFn);
+    %     %     refStack{DMDix}.IM(:,:,:,cix) = A.data;
+    %     % end
     otherwise
-        error('Too many reference stacks found in the specified directory!');
+        list = dir([dr filesep '**' filesep '*DMD' int2str(DMDix) '_CONFIG1-REFERENCE*']);
+        switch length(list)
+            case 0
+                error('Too many reference stacks found in the specified directory!');
+            case 1
+                DMD1refFn = fullfile(list(1).folder, list(1).name);
+                A = ScanImageTiffReader(DMD1refFn);
+                refStack{DMDix}.IM = A.data;
+            
+                %load metadata for the reference stack and BCI ROI
+                desc = A.descriptions;
+                zIx = 0; Zs = []; channels = [];
+                for imIx = 1:numel(desc)
+                        jj = jsondecode(desc{imIx});
+                        if ~any(channels == jj.channel)
+                            channels = [channels jj.channel];
+                        end
+                        if imIx==1
+                            accumChan = jj.channel;
+                        end
+                        if jj.channel == accumChan
+                            zIx = zIx +1;
+                            Zs(zIx) = jj.z;
+                        end
+                end
+                refStack{DMDix}.channels = channels;
+                refStack{DMDix}.Zs = Zs;
+                refStack{DMDix}.dmdPixel2SampleTransform = jj.dmdPixel2SampleTransform;
+            otherwise
+                error('Too many CONFIG1 reference stacks found in the specified directory!');
+        end
     end
 
 

@@ -92,18 +92,17 @@ switch params.microscope
             disp('Reordering channels for analysis!')
         end
         IM1 = squeeze(IM(:,:,1,:));
+        IMsel = interpArray(IM1, any(selPix,3), motOutput); %interpolate the movie at the shifted coordinates
+
         if numChannels==2
             IM2 =  squeeze(IM(:,:,2,:));
             clear IM;
             IM2sel = interpArray(IM2, any(selPix,3), motOutput); %interpolate the movie at the shifted coordinates
             clear IM2;
-            IM2sel = IM2sel - min(0, min(mean(IM2sel,2, 'omitnan')));%ensure that the baseline is not overestimated
-            discard = reshape(repmat(discardFrames(:), 1,params.dsFac)', 1,[]); %upsample the discard frames
-            IM2sel(:,discard) = nan;     %throw away movement frames as above
         else %1 channel
             clear IM;
         end
-        IMsel = interpArray(IM1, any(selPix,3), motOutput); %interpolate the movie at the shifted coordinates
+        
 end
 
 
@@ -112,6 +111,9 @@ IMsel(:,discard) = nan;     %throw away movement frames as above
 exptSummary.global.F(discard,:) = nan;
 exptSummary.ROIs.F(:, discard,:) = nan;
 exptSummary.ROIs.Fsvd(:,discard,:) = nan;
+if numChannels ==2
+     IM2sel(:,discard) = nan;
+end
 
 [IMselFilt, IMselRaw, F0sel, W, selNans] = prepareNMFproblem(IMsel, W0, F0selDS, params);
 

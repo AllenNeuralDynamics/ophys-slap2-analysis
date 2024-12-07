@@ -24,19 +24,21 @@ else
 end
 
 %set up parallelization
-p = gcp('nocreate'); % If no pool, do not create new one.
-if isempty(p)
-    poolsize = 0;
-else
-    poolsize = p.NumWorkers;
-end
-nWorkers = min(params.nWorkers, numel(trialTable.filename));
-if poolsize<nWorkers
-    delete(gcp('nocreate'));
-    if params.nWorkers<4
-        warning('You are using few parallel workers!');
+if params.nWorkers>1
+    p = gcp('nocreate'); % If no pool, do not create new one.
+    if isempty(p)
+        poolsize = 0;
+    else
+        poolsize = p.NumWorkers;
     end
-    parpool('processes',nWorkers); %limit the number of workers to avoid running out of RAM %4-30-24, lowering processes again to prevent another error (18 --> 15)
+    nWorkers = min(params.nWorkers, numel(trialTable.filename));
+    if poolsize<nWorkers
+        delete(gcp('nocreate'));
+        if params.nWorkers<4
+            warning('You are using few parallel workers!');
+        end
+        parpool('processes',nWorkers); %limit the number of workers to avoid running out of RAM %4-30-24, lowering processes again to prevent another error (18 --> 15)
+    end
 end
 
 %align in parallel
@@ -44,6 +46,12 @@ nTrials= numel(trialTable.filename);
 fnRegDS = cell(1, nTrials); fnRaw = cell(1, nTrials); fnAdata = cell(1, nTrials);
 parfor f_ix = 1:nTrials
     [fnRegDS{f_ix}, fnRaw{f_ix}, fnAdata{f_ix}]= alignAsync(dr, trialTable, params, f_ix);
+end
+
+if isfield(params, 'denoise20Hz') && params.denoise20Hz
+    for ix = 1:length(fnRaw)
+        [fnRaw{ix}, fnRegDS{ix}] = denoise20Hz(dr, fnRaw{ix}, params.ds_time);
+    end
 end
 
 trialTable.fnRegDS = fnRegDS;

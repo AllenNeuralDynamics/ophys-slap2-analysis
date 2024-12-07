@@ -25,7 +25,7 @@ switch fnName
         params.denoiseWindow_s = 0.25;   tooltips.denoiseWindow_s= 'the timescale on which signals can be smoothed when denoising, seconds';
         params.baselineWindow_Glu_s = 4; tooltips.baselineWindow_Glu_s= 'timescale for calculating F0 in glutamate channel, seconds';
         params.baselineWindow_Ca_s = 4;  tooltips.baselineWindow_Ca_s= 'timescale for calculating F0 in calcium channel, seconds';
-        params.activityChannel = 1;      tooltips.activityChannel = 'the channel of the original tiff image that contains the glutamate signal';
+        params.activityChannel = 2;      tooltips.activityChannel = 'the channel of the original tiff image that contains the glutamate signal';
         params.tau_s = 0.05;             tooltips.tau_s = 'decay time constant of glutamate signal';
         params.maxSynapseDensity = 0.01; tooltips.maxSynapseDensity = 'maximum synapses per pixel';
         params.nParallelWorkers = 8;     tooltips.nWorkers = 'number of parallel workers';
@@ -54,6 +54,18 @@ switch fnName
         params.alpha = 0.005; tooltips.alpha = 'exponential decay of template per frame';%exponential time constant for template
         params.nWorkers = 16; tooltips.nWorkers = 'number of parallel workers';
         params.overwriteExisting = false; tooltips.overwriteExisting = 'Realign and overwrite any existing files?';
+        params.refStackTemplate = false; tooltips.refStackTemplate = 'Use ref stack as template';
+    case 'integrationRegistration'
+        params.alignHz = 80; tooltips.alignHz = 'Frequency for generating downsampled aligned tiffs';
+        params.maxshiftXY = 25; tooltips.maxshift = 'Maximum frame offset,in pixels';
+        params.maxshiftZ = 10; tooltips.maxshift = 'Maximum frame offset,in pixels';
+        params.clipShift = 5; tooltips.clipShift = 'Maximum allowable shift per frame';
+        params.robust = false; tooltips.robust = 'Use robust likelihood?';
+        params.efficientTiffSave = false; tooltips.efficientTiffSave = 'Save Tiffs locally first then transfer?';
+        params.tempFileDir = 'C:\temp'; tooltips.tempFileDir = 'Directory for temp files';
+        % params.alpha = 0.005; tooltips.alpha = 'exponential decay of template per frame';%exponential time constant for template
+        params.nWorkers = 16; tooltips.nWorkers = 'number of parallel workers';
+        params.overwriteExisting = false; tooltips.overwriteExisting = 'Realign and overwrite any existing files?';
     case 'stripRegBergamo'
         params.maxshift = 50; tooltips.maxshift = 'Maximum frame offset,in pixels';
         params.clipShift = 10; tooltips.clipShift = 'Maximum allowable shift per frame';
@@ -61,6 +73,7 @@ switch fnName
         params.overwriteExisting = false; tooltips.overwriteExisting = 'Realign and overwrite any existing files?';
         params.removeLines = 4; tooltips.removeLines = 'remove this many flyback lines from the top of each image';
         params.ds_time = 3; tooltips.ds_time = 'movies are downsampled (2^ds_time)x in time for alignment';
+        params.denoise20Hz = false;
     otherwise
         error('Unknown function name passed to setParams.m')
 end             

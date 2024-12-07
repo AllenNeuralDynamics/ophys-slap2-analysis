@@ -92,16 +92,20 @@ end
 %PROCESS DATA
 for DMDix = nDMDs:-1:1
     %set up parallelization
-    p = gcp('nocreate');
-    if isempty(p)
-        poolsize = 0;
+    if params.nParallelWorkers>1
+        p = gcp('nocreate');
+        if isempty(p)
+            poolsize = 0;
+        else
+            poolsize = p.NumWorkers;
+        end
+        nWorkers = min(params.nParallelWorkers, size(trialTable.filename,2));
+        if poolsize~=nWorkers
+            delete(gcp('nocreate'));
+            parpool('processes',nWorkers); %limit the number of workers to avoid running out of RAM %4-30-24, lowering processes again to prevent another error (18 --> 15)
+        end
     else
-        poolsize = p.NumWorkers;
-    end
-    nWorkers = min(params.nParallelWorkers, size(trialTable.filename,2));
-    if poolsize~=nWorkers
         delete(gcp('nocreate'));
-        parpool('processes',nWorkers); %limit the number of workers to avoid running out of RAM %4-30-24, lowering processes again to prevent another error (18 --> 15)
     end
 
     %Perform Localizations
@@ -261,11 +265,12 @@ for DMDix = nDMDs:-1:1
     fns = trialTable.fnRaw(DMDix,:);
     if size(W0, 2) > 0
     if strcmpi(params.microscope, 'SLAP2')
-        %this step is not very memory-demanding for SLAP2; increase parallel workers
-        newN = min(min(24,nWorkers*5), size(trialTable.filename,2));
-        if nWorkers~=newN
-            delete(gcp('nocreate'));
-            parpool('processes',newN); %limit the number of workers to avoid running out of RAM %4-30-24, lowering processes again to prevent another error (18 --> 15)
+        if params.nParallelWorkers>1
+            newN = min(min(24,nWorkers*5), size(trialTable.filename,2)); %this step is not very memory-demanding for SLAP2; increase parallel workers
+            if nWorkers~=newN
+                delete(gcp('nocreate'));
+                parpool('processes',newN); %limit the number of workers to avoid running out of RAM %4-30-24, lowering processes again to prevent another error (18 --> 15)
+            end
         end
 
         fls = trialTable.firstLine(DMDix,:);

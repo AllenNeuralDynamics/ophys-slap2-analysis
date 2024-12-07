@@ -23,7 +23,7 @@ if isempty(p)
 else
     poolsize = p.NumWorkers;
 end
-nWorkers = min(params.nWorkers, numel(trialTable.filename));
+nWorkers = min([params.nWorkers, numel(trialTable.filename), feature('numcores')]);
 if poolsize<nWorkers
     delete(gcp('nocreate'));
     if params.nWorkers<15
@@ -125,7 +125,24 @@ disp(['Aligning: ' [dr filesep fn]])
         template(:,:,fix) = interp2(1:sz(2), 1:sz(1), Y(:,:,frameInds(fix)),viewC-motion(2,frameInds(fix), maxind), viewR-motion(1,frameInds(fix), maxind), 'linear', nan);
     end
     template = mean(template, 3); 
-    T0 = template;
+    
+    if params.refStackTemplate
+        fullTemplate = nan(size(trialTable.refStack{DMD_ix}.IM,[2 1]));
+        fullTemplate((min(trimRows)-aData.maxshift):(max(trimRows)+aData.maxshift),(min(trimCols)-aData.maxshift):(max(trimCols)+aData.maxshift)) = template;
+    
+        if numel(trialTable.refStack{DMD_ix}.channels) == 2
+            refStack = (trialTable.refStack{DMD_ix}.IM(:,:,1:2:end) + trialTable.refStack{DMD_ix}.IM(:,:,2:2:end))/2;
+        else
+            refStack = trialTable.refStack{DMD_ix}.IM;
+        end
+        templateShifts = xcorr2_nans(fullTemplate,refStack(:,:,floor(end/2)+1)',[0;0],aData.maxshift);
+        T0 = imtranslate(permute(refStack,[2 1 3]),[templateShifts(2:-1:1),0]);
+        T0 = T0((min(trimRows)-aData.maxshift):(max(trimRows)+aData.maxshift),(min(trimCols)-aData.maxshift):(max(trimCols)+aData.maxshift),:);
+        disp('template generated from reference stack')
+    else
+        T0 = template;
+    end
+    
     clear Y Yhp;
 
     initR = 0; initC = 0;
@@ -139,6 +156,9 @@ disp(['Aligning: ' [dr filesep fn]])
 
     motionDSr = nan(1,nDSframes); 
     motionDSc = nan(1,nDSframes); %matrices to store the inferred motion
+    if params.refStackTemplate
+        motionDSz = nan(1,nDSframes); %matrices to store the inferred motion
+    end
     aErrorDS = nan(1,nDSframes); %alignment error output by dftregistration
     %aRankCorrDS = nan(1,nDSframes); %rank correlation, a better measure of alignment quality
     %recNegErr = nan(1,nDSframes); %rectified negative error, a better measure of alignment quality
@@ -164,11 +184,20 @@ disp(['Aligning: ' [dr filesep fn]])
         if ~mod(DSframeIx, 1000)
             disp([int2str(DSframeIx) ' of ' int2str(nDSframes)]);
         end
-
-        Ttmp = mean(cat(3, T0,template),3, 'omitnan');
-        T = Ttmp(aData.maxshift-initR + (1:sz(1)), aData.maxshift-initC+(1:sz(2)));
         
-        [motOutput, corrCoeff] = xcorr2_nans(M, T, [0 ; 0], aData.clipShift);
+        % Ttmp = mean(cat(3, T0,template),3, 'omitnan');
+        % T = Ttmp(aData.maxshift-initR + (1:sz(1)), aData.maxshift-initC+(1:sz(2)));
+        
+        if params.refStackTemplate
+            T = T0(aData.maxshift-initR + (1:sz(1)), aData.maxshift-initC+(1:sz(2)),:);
+            [motOutput, corrCoeff] = xcorr2_nans3d(M, T, [0 ; 0], aData.clipShift);
+            motionDSz(DSframeIx) = motOutput(3);
+        else
+            Ttmp = mean(cat(3, T0,template),3, 'omitnan');
+            T = Ttmp(aData.maxshift-initR + (1:sz(1)), aData.maxshift-initC+(1:sz(2)));
+            [motOutput, corrCoeff] = xcorr2_nans(M, T, [0 ; 0], aData.clipShift);
+        end
+
         motionDSr(DSframeIx) = initR+motOutput(1);
         motionDSc(DSframeIx) = initC+motOutput(2);
         aErrorDS(DSframeIx) = 1-corrCoeff^2;
@@ -240,6 +269,9 @@ disp(['Aligning: ' [dr filesep fn]])
     aData.DSframes = DSframes;
     aData.motionDSc = motionDSc;
     aData.motionDSr = motionDSr;
+    if params.refStackTemplate
+        aData.motionDSz = motionDSz;
+    end
     aData.aError = aErrorDS;
     %aData.aRankCorrDS = aRankCorrDS;
     aData.recNegErr = recNegErr;
