@@ -102,6 +102,7 @@ try
     end
     frametime = median(diff(timestamp(1:numChannels:end)));
 catch  % use default frametime if there is no metadata (e.g. simulated data)
+    disp('Warning! Failed to compute framerate from metadata. Using default frametime=0.0023')
     frametime = 0.0023;
 end
 aData.numChannels = numChannels;

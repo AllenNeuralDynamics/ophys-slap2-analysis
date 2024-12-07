@@ -38,6 +38,7 @@ W = W(:,SNR>SNRcut);
 H = H(SNR>SNRcut,:);
 resid = X-W*H;
 k = size(W,2); %number of sources
+
 if k == 0
     Wout = W;
     Hout = H;

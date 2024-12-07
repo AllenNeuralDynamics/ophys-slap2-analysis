@@ -60,12 +60,6 @@ randName = [int2str(round(1e10*rand+0.1)) '.tif'];
 localpath = [localDir  filesep   randName];
 disp(localpath)
 copyfile(remotepath, localpath);
-% A = ScanImageTiffReader(localpath);
-% data = A.data();
-% if nargout>1
-%     meta = A.metadata;
-% end
 [data, desc, meta] = networkScanImageTiffReader(localpath);
-% delete(A);
 delete(localpath);
 end

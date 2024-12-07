@@ -20,7 +20,7 @@ if nargin<2
         epochfiles{epoch} = {unpickedfiles(indx).name};
         unpickedfiles(indx) = [];
     end
-elseif ~iscell(fns) && contains(fns, '.tif') %generate an autoTrialTable with all files
+elseif ~iscell(fns) && (contains(fns, '.tif') || fns==true) %generate an autoTrialTable with all files
     %select all tif files in folder that are not REGISTERED and put them in
     %a single epoch
     epoch  = 1;

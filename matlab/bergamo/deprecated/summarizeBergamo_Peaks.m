@@ -109,7 +109,6 @@ for trialIx = length(fns):-1:1
         rawIM2s{trialIx}(:,:,discardFrames{trialIx}) = nan;
     end
 
-    disp('Localizing Flashes')
     [IMc, peaks(trialIx), params] = localizeFlashesBergamo(rawIMs{trialIx}, aData, params);
 
     %calculate correlation image
