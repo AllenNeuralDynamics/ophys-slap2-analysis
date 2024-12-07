@@ -69,8 +69,6 @@ fn = strcat(fn,ext);
 disp(['Aligning: ' [dr filesep fn]])
 
 [Ad, desc, meta] = networkScanImageTiffReader([dr filesep fn]);
-
-% begin CHANGED
 try
     evalc(desc{1});
 
@@ -83,13 +81,11 @@ try
     end
     numChannels = length(SI.hChannels.channelSave);
     selCh = 1:numChannels;
-catch
+catch  % assume 1 channel if there is no metadata (e.g. simulated data)
     numChannels = 1;
     selCh = 1
 end
-% end CHANGED
 
-% begin CHANGED
 try
     pat = "frameTimestamps_sec = " + digitsPattern + "." + digitsPattern;
     for frame = 1:10*numChannels %compute the framerate from the metadata by reading a few frames
@@ -97,11 +93,9 @@ try
         timestamp(frame) = str2double(E{1}(23:end)); %#ok<AGROW>
     end
     frametime = median(diff(timestamp(1:numChannels:end)));
-catch
+catch  % use default frametime if there is no metadata (e.g. simulated data)
     frametime = 0.0023;
 end
-% end CHANGED
-
 aData.numChannels = numChannels;
 aData.frametime = frametime;
 aData.alignHz = 1/frametime/dsFac;
@@ -313,9 +307,6 @@ nanCols = mean(mean(isnan(tiffSave),3),1) == 1;
 tiffSave(nanRows,:,:) = [];
 tiffSave(:,nanCols,:) = [];
 
-% begin ADDED
-dr = strrep(dr, '/data', '/results');
-% end ADDED
 networkTiffWriter(tiffSave, [dr filesep fnDS], pixelscale);
 clear('tiffSave');
 

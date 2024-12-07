@@ -28,7 +28,8 @@ for sourceIx = k:-1:1
     SNR(sourceIx) = vD1./vResid;
 end
 SNRcut = 1;
-if ~any(SNR>SNRcut)
+is_gui_mode = usejava('desktop') && usejava('awt');
+if ~any(SNR>SNRcut) && is_gui_mode
     figure('name', 'This recording yielded no sources above SNR cutoff'),
     imagesc(X);
     error('No ROIs met the SNR cutoff, aborting!')
@@ -37,8 +38,11 @@ W = W(:,SNR>SNRcut);
 H = H(SNR>SNRcut,:);
 resid = X-W*H;
 k = size(W,2); %number of sources
-
-
+if k == 0
+    Wout = W;
+    Hout = H;
+    return
+end
 
 %convert W to Wfull and dilate to compute overlap
 Wfull = zeros(sz(1)*sz(2), k);
