@@ -6,8 +6,7 @@ SLAP2 Summary files are MATLAB v7.3 HDF5 files containing processed glutamate im
 
 ## File Format Details
 
-- **Format**: MATLAB v7.3 (HDF5-based)
-- **Typical Size**: 8-10 GB
+- **Format**: MATLAB v7.3 MAT-file (HDF5 schema)
 - **Extension**: `.mat`
 - **Naming**: `Summary-YYMMDD-HHMMSS.mat`
 
