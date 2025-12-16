@@ -39,8 +39,8 @@ f4 = freshness(rr,cc); f4(Rinvalid,:) = nan; f4(:,Cinvalid) = nan;
 % Var(Z) = c1²Var(X) + c2²Var(Y) +c3²Var(W)
 %the variance of each a1...a4 is (n1*a1)/n1.^2, i.e. (original photon
 %counts)/averaging factor
-IM = (c1*f1.*a1+c2*f2.*a2+c3*f3.*a3+c4*f4.*a4) ./ (c1*f1+c2*f2+c3*f3+c4*f4);
+IM = sum(cat(3,c1*f1.*a1,c2*f2.*a2,c3*f3.*a3,c4*f4.*a4),3,"omitmissing") ./ sum(cat(3,c1*f1,c2*f2,c3*f3,c4*f4),3,"omitmissing");
 %vIM = c1.^2./f1 + c2.^2./f2 + c3.^2./f3 + c4.^2./f4;
-vIM = 1./(c1*f1 + c2*f2 + c3*f3 + c4*f4); %this is not the single-pixel variance, but rather a local variance multiplier
+vIM = 1./sum(cat(3,c1*f1,c2*f2,c3*f3,c4*f4),3,"omitmissing"); %this is not the single-pixel variance, but rather a local variance multiplier
 vIM(isinf(vIM)) = nan;
 end

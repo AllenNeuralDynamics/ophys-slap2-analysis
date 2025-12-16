@@ -88,7 +88,7 @@ else
 end
 
 %PROCESS DATA
-for DMDix = nDMDs:-1:1
+for DMDix = 1; %nDMDs:-1:1
     %load some metadata
     [~, fn, ext] = fileparts(trialTable.fnAdata{DMDix,firstValidTrial});
     load([dr filesep fn ext], 'aData');

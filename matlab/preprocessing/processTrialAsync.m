@@ -42,9 +42,11 @@ switch params.microscope
         for fix = nFrames:-1:1
             for cix = 1:numel(orderedChannels)
                 % Y = S2data.getImage(orderedChannels(cix), frameLines(fix), ceil(dt), 1);
-                [Y, ~] = getImageWrapper(S2data, orderedChannels(cix), frameLines(fix), ceil(dt), 1, spTypeFlag);
+                [Y, freshness] = getImageWrapper(S2data, orderedChannels(cix), frameLines(fix), ceil(dt), 1, spTypeFlag);
                 Y = Y(alignData.trimRows, alignData.trimCols);
-                Y = interp2(1:Ysz(2), 1:Ysz(1), Y,alignData.viewC+motionC(fix), alignData.viewR+motionR(fix), 'linear', nan);
+                freshness = freshness(alignData.trimRows, alignData.trimCols);
+                % Y = interp2(1:Ysz(2), 1:Ysz(1), Y,alignData.viewC+motionC(fix), alignData.viewR+motionR(fix), 'linear', nan);
+                [Y, ~] = interpFrame(Y, alignData.viewC+motionC(fix), alignData.viewR+motionR(fix), freshness);
                 if cix==1
                     IMsel(:, fix) = Y(selPx2D);
                 elseif cix==2
@@ -84,9 +86,11 @@ switch params.microscope
                 for fix = nFramesSoma:-1:1
                     for cix = 1:numel(orderedChannels)
                         % Y = S2data.getImage(orderedChannels(cix), somaLines(fix), ceil(dtSoma), 1);
-                        [Y, ~] = getImageWrapper(S2data, orderedChannels(cix), somaLines(fix), ceil(dtSoma), 1, spTypeFlag);
+                        [Y, freshness] = getImageWrapper(S2data, orderedChannels(cix), somaLines(fix), ceil(dtSoma), 1, spTypeFlag);
                         Y = Y(alignData.trimRows, alignData.trimCols);
-                        Y = interp2(1:Ysz(2), 1:Ysz(1), Y,alignData.viewC+motionC(fix), alignData.viewR+motionR(fix), 'linear', nan);
+                        freshness = freshness(alignData.trimRows, alignData.trimCols);
+                        [Y, ~] = interpFrame(Y, alignData.viewC+motionC(fix), alignData.viewR+motionR(fix), freshness);
+                        % Y = interp2(1:Ysz(2), 1:Ysz(1), Y,alignData.viewC+motionC(fix), alignData.viewR+motionR(fix), 'linear', nan);
                         mIM = meanIM(:,:,orderedChannels(cix));
                         for rix = 1:length(roiData)
                             mask = roiData{rix}.mask;
