@@ -46,7 +46,7 @@ switch params.microscope
                 Y = Y(alignData.trimRows, alignData.trimCols);
                 freshness = freshness(alignData.trimRows, alignData.trimCols);
                 % Y = interp2(1:Ysz(2), 1:Ysz(1), Y,alignData.viewC+motionC(fix), alignData.viewR+motionR(fix), 'linear', nan);
-                [Y, ~] = interpFrame(Y, alignData.viewC+motionC(fix), alignData.viewR+motionR(fix), freshness);
+                [Y, ~] = interpFrame(Y, alignData.viewC(1,:)+motionC(fix), alignData.viewR(:,1)+motionR(fix), freshness);
                 if cix==1
                     IMsel(:, fix) = Y(selPx2D);
                 elseif cix==2
@@ -89,7 +89,7 @@ switch params.microscope
                         [Y, freshness] = getImageWrapper(S2data, orderedChannels(cix), somaLines(fix), ceil(dtSoma), 1, spTypeFlag);
                         Y = Y(alignData.trimRows, alignData.trimCols);
                         freshness = freshness(alignData.trimRows, alignData.trimCols);
-                        [Y, ~] = interpFrame(Y, alignData.viewC+motionC(fix), alignData.viewR+motionR(fix), freshness);
+                        [Y, ~] = interpFrame(Y, alignData.viewC(1,:)+motionC(fix), alignData.viewR(:,1)+motionR(fix), freshness);
                         % Y = interp2(1:Ysz(2), 1:Ysz(1), Y,alignData.viewC+motionC(fix), alignData.viewR+motionR(fix), 'linear', nan);
                         mIM = meanIM(:,:,orderedChannels(cix));
                         for rix = 1:length(roiData)
