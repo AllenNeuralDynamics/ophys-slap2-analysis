@@ -226,15 +226,13 @@ for DMDix = nDMDs:-1:1
     %select sources
     %strategy 1: find peaks directly on aligned activity image
     actIM = mean(actAligned(:,:,:,validTrials), 4, 'includenan');
-    medIM = nanmedfilt2(actIM, (2*ceil(1.5*params.dXY)+1).*[1 1]);
+    actIM = actIM ./ 10^(floor(log10(max(actIM(:))))-1);
+    nanFrac = mean(isnan(actAligned(:,:,:,validTrials)), 4);
+    actIM(nanFrac>params.nanThresh) = nan;
+    medIM = nanmedfilt2(actIM, 5.*[1 1]);
     actIM = actIM-medIM; %subtract a local baseline
-    explored = actIM; pTmp = explored>0 & explored == ordfilt2(explored, 9, ones(3));
-    pIM = false(size(actIM));
-    while any(pTmp(:))
-        pIM = pIM | pTmp;
-        explored(imdilate(pTmp, ones(5))) = 0;
-        pTmp = explored>0 & explored == ordfilt2(explored, 9, ones(3));
-    end
+    exptSummary.actIM{DMDix} = actIM;
+    sz = size(actIM);
 
     %Mask out somata from activity image
     somaMask = false(size(actIM));
@@ -246,17 +244,16 @@ for DMDix = nDMDs:-1:1
             end
         end
     end
-    pIM(somaMask) = 0;
-    p = actIM(pIM);
-    sortedP = sort(p, 'descend');
+
+    thetaf = getActImPeaks(actIM,params.peakth,2,somaMask);
+
     totalPix = sum(~isnan(actIM(:)) & ~somaMask(:));
-    if totalPix == 0 | isempty(p)
+    if totalPix == 0 | isempty(thetaf)
         k = 0;
     else
-        threshP = 2*sortedP(min(end, ceil(totalPix*params.maxSynapseDensity))); %maximum synapse density
-        pp = actIM; pp(~pIM) = 0; pp(pp<threshP) = 0;
-        [sources.R,sources.C,sources.V] = find(pp);
-        sz = size(pp);
+        sources.R = round(thetaf(:,2));
+        sources.C = round(thetaf(:,3));
+        sources.V = thetaf(:,1);
         k = length(sources.R);
     end
 

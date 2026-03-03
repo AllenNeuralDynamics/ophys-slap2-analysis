@@ -1,4 +1,4 @@
-function [summaryEroded, P] = localizeSources_vIM(IM, vIM, params, doPlot)
+function [skIm, P] = localizeSources_vIM(IM, vIM, params, doPlot)
 %inputs:
 %IM:        3D recording, X x Y x Time
 %aData:     alignment metadata
@@ -68,13 +68,13 @@ if params.microscope == "SLAP2"
 
     stdIM = sqrt(Vk.*IMb.*vIM+Vb); %compute standard deviation
 else
-    IMfden = smoothdata(IMf, 3, 'movmean', denoiseWindow, 'omitnan');
+    IMfden = smoothdata(IMf, 3, 'movmean', ceil(denoiseWindow/2), 'omitnan');
     %Highpass filter in time; This must occur before DoG to avoid edge artifacts
     IMb = smoothdata(IMfden, 3, 'movmedian', baselineWindow, 'omitnan');
     IMf = IMf - IMb;   %- smoothdata(IMf, 3, 'movmedian', baselineWindow, 'omitnan');
 
     % MAD-based robust standard deviation estimate
-    stdIM = movmad(IMfden - IMb,baselineWindow,3,'omitmissing') ./ 0.6741891400433162.*denoiseWindow;
+    stdIM = movmad(IMfden - IMb,baselineWindow,3,'omitmissing') ./ 0.6741891400433162.*ceil(denoiseWindow/2);
 end
 %divide by uncertainty to get a Z-score
 IMf = IMf./stdIM;
@@ -117,49 +117,26 @@ clear nans
 
 %summary = skewness(IMf(:,:, 1:end-3*ceil(tau)), 1,3); %.*IMgamma; 
 summaryEroded = skIm;
+
+summaryEroded = summaryEroded ./ 10^(floor(log10(max(summaryEroded(:))))-1);
 summaryEroded(~valid) = nan;
 mfSummary = nanmedfilt2(summaryEroded, [5 5]);
 summaryEroded = summaryEroded - mfSummary;
 %valid = valid & (skIm ~= 0);
 summaryEroded(~valid) = nan;
 
-%find local maxima
-peaks = summaryEroded == ordfilt2(summaryEroded, 9, ones(3)); %> circshift(summaryEroded,1,dim) &  summaryEroded > circshift(summaryEroded,-1,dim);
+skIm(~valid) = nan;
 
-p = summaryEroded(peaks);
-sortedP = sort(p, 'descend');
-totalPix = sum(~isnan(summaryEroded(:)));
+thetaf = getActImPeaks(summaryEroded,params.peakth,2);
 
-if totalPix<10 || sum(peaks(:))==0
-    P.row = [];
-    P.col = [];
-    P.val = [];
-    P.peakIM = zeros(size(summaryEroded));
-    return
-end
+P.row = thetaf(:,2);
+P.col = thetaf(:,3);
+P.val = thetaf(:,1);
 
-threshP = 1.5*sortedP(min(end,ceil(totalPix * params.maxSynapseDensity * (1-exp(-nTimePoints./params.alignHz./10)))));
-pp = summaryEroded; pp(~peaks) = 0; pp(pp<threshP) = 0;
-[rrr,ccc,vvv] = find(pp);
+peaksMask = zeros(size(summaryEroded));
+peaksMask(sub2ind(size(peaksMask), round(P.row), round(P.col))) = 1;
 
-%upsample for superresolution
-pC = []; pR = [];
-for peakIx = length(vvv):-1:1
-    R = summaryEroded(rrr(peakIx)+(-1:1), ccc(peakIx));
-    C = summaryEroded(rrr(peakIx), ccc(peakIx)+(-1:1));
-
-    ratioR = min(1e6,(R(2) - R(1))/(R(2) - R(3)));
-    dR = (1-ratioR)/(1+ratioR)/2;
-    pR(peakIx) = rrr(peakIx)-dR;
-
-    ratioC = min(1e6,(C(2) - C(1))/(C(2) - C(3)));
-    dC = (1-ratioC)/(1+ratioC)/2;
-    pC(peakIx) = ccc(peakIx)-dC;
-end
-P.row = pR(:);
-P.col = pC(:);
-P.val = vvv(:);
-P.peakIM = pp;
+P.peakIM = summaryEroded .* peaksMask;
 
 if doPlot
     figure, imagesc(summaryEroded); %hAx1 = gca;
@@ -167,4 +144,85 @@ if doPlot
     figure, imagesc(summaryEroded); %hAx2 = gca;
 end
 
+end
+
+function val = gaussianPeaksIntegrated(theta, yxdata)
+% Same interface as original:
+% theta  : N×4  [A, mux, muy, sigma]
+% yxdata : M×2  pixel centers [x, y]
+% val    : M×1  integrated Gaussian over each pixel
+
+x = yxdata(:,1);
+y = yxdata(:,2);
+
+% --- infer pixel size from grid ---
+xu = unique(x);
+yu = unique(y);
+
+dx = median(diff(xu));
+dy = median(diff(yu));
+
+% build edges
+xEdges = [xu(1)-dx/2; (xu(1:end-1)+xu(2:end))/2; xu(end)+dx/2];
+yEdges = [yu(1)-dy/2; (yu(1:end-1)+yu(2:end))/2; yu(end)+dy/2];
+
+W = numel(xu);
+H = numel(yu);
+
+% reshape index map
+[~, xIdx] = ismember(x, xu);
+[~, yIdx] = ismember(y, yu);
+
+% --- parameters ---
+A  = theta(:,1).';   % 1×N
+mx = theta(:,2).';
+my = theta(:,3).';
+s  = max(theta(:,4).', eps);
+
+c   = sqrt(pi/2);
+rt2 = sqrt(2);
+
+% --- integrate in x (W×N) ---
+xL = xEdges(1:end-1);
+xR = xEdges(2:end);
+Ix = c .* s .* ( ...
+    erf((xR - mx)./(rt2*s)) - ...
+    erf((xL - mx)./(rt2*s)) );
+
+% --- integrate in y (H×N) ---
+yB = yEdges(1:end-1);
+yT = yEdges(2:end);
+Iy = c .* s .* ( ...
+    erf((yT - my)./(rt2*s)) - ...
+    erf((yB - my)./(rt2*s)) );
+
+% --- combine to full image ---
+img = (Iy .* A) * Ix.';   % H×W
+
+% --- return in original point ordering ---
+val = img(sub2ind([H W], yIdx, xIdx));
+end
+
+
+function val = gaussianPeaks(theta, yxdata)
+
+y = yxdata(:,1);
+x = yxdata(:,2);
+
+A  = theta(:,1).';
+my = theta(:,2).';
+mx = theta(:,3).';
+s  = theta(:,4).';
+
+inv2s2 = 1 ./ (2 * s.^2);
+
+dx = x - mx;
+dy = y - my;
+
+E = exp( -(dx.^2 + dy.^2) .* inv2s2 );
+val = E * A.';
+end
+
+function loss = objFun(theta, yxdata, zdata, lambda)
+loss = mean((gaussianPeaksIntegrated(theta,yxdata) - zdata).^2) + lambda * mean(abs(theta(:,1)));
 end
