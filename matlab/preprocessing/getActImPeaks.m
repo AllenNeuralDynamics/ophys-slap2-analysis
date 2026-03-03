@@ -1,8 +1,9 @@
-function thetaf = getActImPeaks(actIM, peakth, bgIM, peakFuncOpt, exclusionMask)
-if nargin < 4
+function thetaf = getActImPeaks(actIM, peakth, peakFuncOpt, exclusionMask)
+% Defaults
+if nargin < 3
     peakFuncOpt = 1;
 end
-if nargin < 5
+if nargin < 4
     exclusionMask = false(size(actIM));
 end
 
@@ -17,7 +18,17 @@ mu_bg = median(actIM,'all','omitmissing');
 sigma_bg = mad(actIM(~isnan(actIM)),1,'all') ./ 0.6741891400433162;
 peak_thresh = mu_bg + peakth * sigma_bg;
 
-explored = actIM .* ~exclusionMask; pTmp = ordfilt2(explored,8,ones(3)) > peak_thresh & explored == ordfilt2(explored, 9, ones(3));
+% Peak amplitude scaling (kept consistent with existing behavior)
+switch peakFuncOpt
+    case 1
+        ampScale = 1;
+    case 2
+        ampScale = 1 ./ 0.75;
+end
+
+explored = actIM .* ~exclusionMask;
+pTmp = ordfilt2(explored, 8, ones(3)) > peak_thresh & ...
+       explored == ordfilt2(explored, 9, ones(3));
 thetaf = zeros(0,4);
 pLocs = zeros(0,2);
 
@@ -25,12 +36,7 @@ if sum(pTmp(:))
     nPeaks = sum(pTmp(:));
 
     [pY, pX] = ind2sub(size(pTmp),find(pTmp));
-    switch peakFuncOpt
-        case 1
-            amp = actIM(pTmp);
-        case 2
-            amp = actIM(pTmp) ./ 0.75;
-    end
+    amp = actIM(pTmp) .* ampScale;
     widths = 0.35 * ones(nPeaks,1);
     
     actSelPix = imdilate(pTmp, ones(9)) & ~isnan(actIM);
@@ -46,29 +52,61 @@ if sum(pTmp(:))
     thetaf = lsqcurvefit(peakFunc,theta0,[actSelY,actSelX],actIM(actSelPix)-mu_bg,lb,ub,opts);
 
     pIM = false(size(actIM));
-    pIM(sub2ind(size(actIM),round(thetaf(:,2)),round(thetaf(:,3)))) = true;
+    iy = min(max(round(thetaf(:,2)), 1), size(actIM,1));
+    ix = min(max(round(thetaf(:,3)), 1), size(actIM,2));
+    pIM(sub2ind(size(actIM), iy, ix)) = true;
     bufferMask = pIM; %imdilate(pIM,ones(3,3));
 
     fitIM = zeros(size(actIM));
     fitIM(actSelPix) = peakFunc(thetaf,[actSelY,actSelX]);
     resIM = actIM - fitIM - mu_bg;
-    resIM = resIM ./ ((fitIM+bgIM+mu_bg) ./ bgIM);
+
+    % fit lambda to the data, by regressing var(resIM) on fitIM
+    % bin pixels based on log fitIM and find proportionality constant
+    validPix = fitIM > 1e-3 & ~isnan(resIM);
+    logFitIM = log10(fitIM(validPix));
+    resIMvals = resIM(validPix);
+    fitIMvals = fitIM(validPix);
+    
+    nBins = 20;
+    binEdges = linspace(min(logFitIM), max(logFitIM), nBins+1);
+    [~,~,binIdx] = histcounts(logFitIM, binEdges);
+    
+    binMeans = zeros(nBins,1);
+    binSDs = zeros(nBins,1);
+    for iBin = 1:nBins
+        if sum(binIdx == iBin) >= 20
+            binMeans(iBin) = mean(fitIMvals(binIdx == iBin));
+            binSDs(iBin) = std(resIMvals(binIdx == iBin));
+        end
+    end
+    
+    validBins = binMeans > 0 & binSDs > 0;
+    if sum(validBins) > 1
+        X = [ones(sum(validBins),1), binMeans(validBins)];
+        y = binSDs(validBins);
+        coeffs = X \ y;
+        sigma_bg_adj = coeffs(1);
+        lambda = coeffs(2);
+    else
+        sigma_bg_adj = sigma_bg;
+        lambda = 1;
+    end
+
+    resIM = resIM ./ (sigma_bg_adj + lambda .* fitIM);
 
     explored = resIM .* ~bufferMask .* ~exclusionMask; % .* (resIM > actIM ./ 3);
     pTmp = zeros(size(explored));
-    if max(explored(fitIM > 1e-3)) > (peak_thresh-mu_bg)
-        pTmp = explored == max(explored(fitIM > 1e-3)); % & explored == ordfilt2(explored, 9, ones(3)) & (fitIM > 1e-3);
+    fitSupport = (fitIM > 1e-3);
+    if any(fitSupport(:)) && max(explored(fitSupport)) > peakth
+        pTmp = explored == max(explored(fitSupport)); % & explored == ordfilt2(explored, 9, ones(3)) & (fitIM > 1e-3);
     end
 
     while sum(pTmp(:))
         idxNew = find(pTmp,1,'first');
         [pY, pX] = ind2sub(size(pTmp),idxNew);
-        switch peakFuncOpt
-            case 1
-                amp = actIM(pTmp);
-            case 2
-                amp = actIM(pTmp) ./ 0.75;
-        end
+        % Use the chosen new peak location (avoid multi-max ambiguity)
+        amp = actIM(idxNew) .* ampScale;
 
         thetaf = [thetaf; [amp, pY, pX, 0.35]];
         pLocs = [pLocs; [pY, pX]];
@@ -81,7 +119,9 @@ if sum(pTmp(:))
                 [actSelY, actSelX] = ind2sub(size(pTmp),find(actSelPix));
                 
                 % Find which theta indices correspond to peaks in this connected component
-                peakIndices = sub2ind(size(actIM), round(thetaf(:,2)), round(thetaf(:,3)));
+                iy = min(max(round(thetaf(:,2)), 1), size(actIM,1));
+                ix = min(max(round(thetaf(:,3)), 1), size(actIM,2));
+                peakIndices = sub2ind(size(actIM), iy, ix);
                 thetaIdxsToFit = actSelPix(peakIndices);
 
                 break;
@@ -94,17 +134,20 @@ if sum(pTmp(:))
         thetaf(thetaIdxsToFit,:) = lsqcurvefit(peakFunc,thetaf(thetaIdxsToFit,:),[actSelY,actSelX],actIM(actSelPix)-mu_bg,lb,ub,opts);
         
         pIM = false(size(actIM));
-        pIM(sub2ind(size(actIM),round(thetaf(:,2)),round(thetaf(:,3)))) = true;
+        iy = min(max(round(thetaf(:,2)), 1), size(actIM,1));
+        ix = min(max(round(thetaf(:,3)), 1), size(actIM,2));
+        pIM(sub2ind(size(actIM), iy, ix)) = true;
         bufferMask = pIM; %imdilate(pIM,ones(3,3));
 
         fitIM(actSelPix) = peakFunc(thetaf,[actSelY,actSelX]);
         resIM = actIM - fitIM - mu_bg;
-        resIM = resIM ./ ((fitIM+bgIM+mu_bg) ./ bgIM);
+        resIM = resIM ./ (sigma_bg_adj + lambda .* fitIM);
     
         explored = resIM .* ~bufferMask .* ~exclusionMask; % .* (resIM > actIM ./ 3);
         pTmp = zeros(size(explored));
-        if max(explored(fitIM > 1e-3)) > (peak_thresh-mu_bg)
-            pTmp = explored == max(explored(fitIM > 1e-3)); % & explored == ordfilt2(explored, 9, ones(3)) & (fitIM > 1e-3);
+        fitSupport = (fitIM > 1e-3);
+        if any(fitSupport(:)) && max(explored(fitSupport)) > peakth
+            pTmp = explored == max(explored(fitSupport)); % & explored == ordfilt2(explored, 9, ones(3)) & (fitIM > 1e-3);
         end
     end
 
@@ -122,8 +165,8 @@ end
 end
 
 function val = gaussianPeaks(theta, yxdata)
-% theta: [N x 4] with columns [amp, mu_x, mu_y, sigma]
-% yxdata: [M x 2] with columns [x, y]
+% theta: [N x 4] with columns [amp, mu_y, mu_x, sigma]
+% yxdata: [M x 2] with columns [y, x]
 %
 % val: [M x 1]
 
@@ -146,12 +189,12 @@ end
 
 function val = gaussianPeaksIntegrated(theta, yxdata)
 % Same interface as original:
-% theta  : N×4  [A, mux, muy, sigma]
-% yxdata : M×2  pixel centers [x, y]
+% theta  : N×4  [A, mu_y, mu_x, sigma]
+% yxdata : M×2  pixel centers [y, x]
 % val    : M×1  integrated Gaussian over each pixel
 
-x = yxdata(:,1);
-y = yxdata(:,2);
+y = yxdata(:,1);
+x = yxdata(:,2);
 
 % --- infer pixel size from grid ---
 xu = unique(x);
@@ -173,8 +216,8 @@ H = numel(yu);
 
 % --- parameters ---
 A  = theta(:,1).';   % 1×N
-mx = theta(:,2).';
-my = theta(:,3).';
+my = theta(:,2).';
+mx = theta(:,3).';
 s  = max(theta(:,4).', eps);
 
 c   = sqrt(pi/2);
