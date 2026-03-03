@@ -127,7 +127,7 @@ summaryEroded(~valid) = nan;
 
 skIm(~valid) = nan;
 
-thetaf = getActImPeaks(summaryEroded,params.peakth,2);
+thetaf = getActImPeaks(summaryEroded,params.peakth,mfSummary,2);
 
 P.row = thetaf(:,2);
 P.col = thetaf(:,3);

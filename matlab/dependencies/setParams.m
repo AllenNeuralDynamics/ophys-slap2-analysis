@@ -37,7 +37,6 @@ switch fnName
         params.activityChannel = 1;      tooltips.activityChannel = 'the channel of the original tiff image that contains the glutamate signal';
         params.tau_s = 0.03;             tooltips.tau_s = 'decay time constant of glutamate signal';
         params.tau2_s = 0.15;            tooltips.tau2_s = 'decay time constant of 2nd channel signal at synapses (usually spine calcium)';
-        params.maxSynapseDensity = 0.01; tooltips.maxSynapseDensity = 'maximum synapses per pixel';
         params.peakth = 4;             tooltips.peakth = 'peak identification threshold (actIM z-score)';
         params.nParallelWorkers = 12;    tooltips.nWorkers = 'number of parallel workers';
         params.drawUserRois = true;     tooltips.drawUserRois = 'pop up a GUI to annotate user ROIs?';  
