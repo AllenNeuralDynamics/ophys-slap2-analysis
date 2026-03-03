@@ -245,7 +245,7 @@ for DMDix = nDMDs:-1:1
         end
     end
 
-    thetaf = getActImPeaks(actIM,params.peakth,2,somaMask);
+    thetaf = getActImPeaks(actIM,params.peakth,medIM,2,somaMask);
 
     totalPix = sum(~isnan(actIM(:)) & ~somaMask(:));
     if totalPix == 0 | isempty(thetaf)
