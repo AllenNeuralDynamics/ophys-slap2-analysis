@@ -41,7 +41,7 @@ vIM(nans) = nan; %1000*mean(vIM(:,:, 1:min(end,400)), 'all', 'omitnan');
 % IMf(reshape(nans, size(IMf))) = IMs(reshape(nans, size(IMf))); clear IMs
 % IMf = reshape(IMf, sz(1),sz(2), []);
 
-if params.microscope == "SLAP2"
+if params.microscope == "SLAP2" || params.poissBasedStdIM
     %smooth the data at a timescale on which fluctuations look more
     %gaussian, for computing variances
     IMs = smoothdata(IMf./vIM, 3, 'movmean', ceil(denoiseWindow/2), 'omitnan');
