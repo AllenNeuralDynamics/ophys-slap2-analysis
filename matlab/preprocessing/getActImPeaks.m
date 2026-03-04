@@ -1,10 +1,16 @@
-function thetaf = getActImPeaks(actIM, peakth, peakFuncOpt, exclusionMask)
+function thetaf = getActImPeaks(actIM, peakth, exclusionMask, peakFuncOpt, heteroscedasticNoise, bufferSize)
 % Defaults
-if nargin < 3
+if nargin < 3 || isempty(exclusionMask)
+    exclusionMask = false(size(actIM));
+end
+if nargin < 4 || isempty(peakFuncOpt)
     peakFuncOpt = 1;
 end
-if nargin < 4
-    exclusionMask = false(size(actIM));
+if nargin < 5 || isempty(heteroscedasticNoise)
+    heteroscedasticNoise = 1;
+end
+if nargin < 6 || isempty(bufferSize)
+    bufferSize = 0;
 end
 
 switch peakFuncOpt
@@ -18,7 +24,8 @@ mu_bg = median(actIM,'all','omitmissing');
 sigma_bg = mad(actIM(~isnan(actIM)),1,'all') ./ 0.6741891400433162;
 peak_thresh = mu_bg + peakth * sigma_bg;
 
-% Peak amplitude scaling (kept consistent with existing behavior)
+opts = optimset('MaxFunEvals',5000,'Display','off');
+
 switch peakFuncOpt
     case 1
         ampScale = 1;
@@ -47,7 +54,6 @@ if sum(pTmp(:))
 
     ub = [Inf*ones(size(theta0,1),1),min(size(actIM,1)+0.5,pLocs(:,1)+1.5),min(size(actIM,2)+0.5,pLocs(:,2)+1.5),5*ones(size(theta0,1),1)];
     lb = [zeros(size(theta0,1),1),max(0.5,pLocs(:,1)-1.5),max(0.5,pLocs(:,2)-1.5),zeros(size(theta0,1),1)];
-    opts = optimset('MaxFunEvals',5000,'Display','off');
 
     thetaf = lsqcurvefit(peakFunc,theta0,[actSelY,actSelX],actIM(actSelPix)-mu_bg,lb,ub,opts);
 
@@ -55,57 +61,62 @@ if sum(pTmp(:))
     iy = min(max(round(thetaf(:,2)), 1), size(actIM,1));
     ix = min(max(round(thetaf(:,3)), 1), size(actIM,2));
     pIM(sub2ind(size(actIM), iy, ix)) = true;
-    bufferMask = pIM; %imdilate(pIM,ones(3,3));
+    if bufferSize > 0
+        bufferMask = imdilate(pIM,ones(bufferSize));
+    else
+        bufferMask = pIM;
+    end
 
     fitIM = zeros(size(actIM));
     fitIM(actSelPix) = peakFunc(thetaf,[actSelY,actSelX]);
     resIM = actIM - fitIM - mu_bg;
 
-    % fit lambda to the data, by regressing var(resIM) on fitIM
-    % bin pixels based on log fitIM and find proportionality constant
-    validPix = fitIM > 1e-3 & ~isnan(resIM);
-    logFitIM = log10(fitIM(validPix));
-    resIMvals = resIM(validPix);
-    fitIMvals = fitIM(validPix);
-    
-    nBins = 20;
-    binEdges = linspace(min(logFitIM), max(logFitIM), nBins+1);
-    [~,~,binIdx] = histcounts(logFitIM, binEdges);
-    
-    binMeans = zeros(nBins,1);
-    binSDs = zeros(nBins,1);
-    for iBin = 1:nBins
-        if sum(binIdx == iBin) >= 20
-            binMeans(iBin) = mean(fitIMvals(binIdx == iBin));
-            binSDs(iBin) = std(resIMvals(binIdx == iBin));
+    if heteroscedasticNoise
+        validPix = fitIM > 1e-3 & ~isnan(resIM);
+        logFitIM = log10(fitIM(validPix));
+        resIMvals = resIM(validPix);
+        fitIMvals = fitIM(validPix);
+        
+        nBins = 20;
+        binEdges = linspace(min(logFitIM), max(logFitIM), nBins+1);
+        [~,~,binIdx] = histcounts(logFitIM, binEdges);
+        
+        binMeans = zeros(nBins,1);
+        binSDs = zeros(nBins,1);
+        for iBin = 1:nBins
+            if sum(binIdx == iBin) >= 20
+                binMeans(iBin) = mean(fitIMvals(binIdx == iBin));
+                binSDs(iBin) = std(resIMvals(binIdx == iBin));
+            end
         end
-    end
+        
+        validBins = binMeans > 0 & binSDs > 0;
+        if sum(validBins) > 1
+            X = [ones(sum(validBins),1), binMeans(validBins)];
+            y = binSDs(validBins);
+            coeffs = X \ y;
+            sigma_bg_adj = coeffs(1);
+            lambda = coeffs(2);
+        else
+            sigma_bg_adj = sigma_bg;
+            lambda = 1;
+        end
     
-    validBins = binMeans > 0 & binSDs > 0;
-    if sum(validBins) > 1
-        X = [ones(sum(validBins),1), binMeans(validBins)];
-        y = binSDs(validBins);
-        coeffs = X \ y;
-        sigma_bg_adj = coeffs(1);
-        lambda = coeffs(2);
+        resIM = resIM ./ (sigma_bg_adj + lambda .* fitIM);
     else
-        sigma_bg_adj = sigma_bg;
-        lambda = 1;
+        resIM = resIM ./ sigma_bg;
     end
 
-    resIM = resIM ./ (sigma_bg_adj + lambda .* fitIM);
-
-    explored = resIM .* ~bufferMask .* ~exclusionMask; % .* (resIM > actIM ./ 3);
-    pTmp = zeros(size(explored));
     fitSupport = (fitIM > 1e-3);
-    if any(fitSupport(:)) && max(explored(fitSupport)) > peakth
-        pTmp = explored == max(explored(fitSupport)); % & explored == ordfilt2(explored, 9, ones(3)) & (fitIM > 1e-3);
+    explored = resIM .* ~bufferMask .* ~exclusionMask .* fitSupport;
+    pTmp = zeros(size(explored));
+    if any(fitSupport(:)) && max(explored(:)) > peakth
+        pTmp = explored == max(explored(:));
     end
 
     while sum(pTmp(:))
         idxNew = find(pTmp,1,'first');
         [pY, pX] = ind2sub(size(pTmp),idxNew);
-        % Use the chosen new peak location (avoid multi-max ambiguity)
         amp = actIM(idxNew) .* ampScale;
 
         thetaf = [thetaf; [amp, pY, pX, 0.35]];
@@ -130,24 +141,31 @@ if sum(pTmp(:))
 
         ub = [Inf*ones(sum(thetaIdxsToFit),1),min(size(actIM,1)+0.5,pLocs(thetaIdxsToFit,1)+1.5),min(size(actIM,2)+0.5,pLocs(thetaIdxsToFit,2)+1.5),5*ones(sum(thetaIdxsToFit),1)];
         lb = [zeros(sum(thetaIdxsToFit),1),max(0.5,pLocs(thetaIdxsToFit,1)-1.5),max(0.5,pLocs(thetaIdxsToFit,2)-1.5),zeros(sum(thetaIdxsToFit),1)];
-        opts = optimset('MaxFunEvals',5000,'Display','off');
         thetaf(thetaIdxsToFit,:) = lsqcurvefit(peakFunc,thetaf(thetaIdxsToFit,:),[actSelY,actSelX],actIM(actSelPix)-mu_bg,lb,ub,opts);
         
         pIM = false(size(actIM));
         iy = min(max(round(thetaf(:,2)), 1), size(actIM,1));
         ix = min(max(round(thetaf(:,3)), 1), size(actIM,2));
         pIM(sub2ind(size(actIM), iy, ix)) = true;
-        bufferMask = pIM; %imdilate(pIM,ones(3,3));
+        if bufferSize > 0
+            bufferMask = imdilate(pIM,ones(bufferSize));
+        else
+            bufferMask = pIM;
+        end
 
         fitIM(actSelPix) = peakFunc(thetaf,[actSelY,actSelX]);
         resIM = actIM - fitIM - mu_bg;
-        resIM = resIM ./ (sigma_bg_adj + lambda .* fitIM);
+        if heteroscedasticNoise
+            resIM = resIM ./ (sigma_bg_adj + lambda .* fitIM);
+        else
+            resIM = resIM ./ sigma_bg;
+        end
     
-        explored = resIM .* ~bufferMask .* ~exclusionMask; % .* (resIM > actIM ./ 3);
-        pTmp = zeros(size(explored));
         fitSupport = (fitIM > 1e-3);
-        if any(fitSupport(:)) && max(explored(fitSupport)) > peakth
-            pTmp = explored == max(explored(fitSupport)); % & explored == ordfilt2(explored, 9, ones(3)) & (fitIM > 1e-3);
+        explored = resIM .* ~bufferMask .* ~exclusionMask .* fitSupport;
+        pTmp = zeros(size(explored));
+        if any(fitSupport(:)) && max(explored(:)) > peakth
+            pTmp = explored == max(explored(:));
         end
     end
 
