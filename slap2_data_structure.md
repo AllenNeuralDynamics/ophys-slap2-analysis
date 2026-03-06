@@ -5,7 +5,7 @@ RAW DATA structure on aind/scratch
  ┣ 🖼️vasculature_map.tif
  ┣ 🖼️vasculature_map_annotated.tif* (constantly updated)
  ┗ 📂FOV## (2 digit FOV ID)/
-   ┣ 📦slap2_######_YYYY-MM-DD_HH-MM-SS (for stacks, Session ID by Mouse ID and datetime)/ <- this is the folder that will become a data asset on CodeOcean
+   ┣ 📦######_YYYY-MM-DD_HH-MM-SS (for stacks, Session ID by Mouse ID and datetime)/ <- this is the folder that will become a data asset on CodeOcean
    ┃ ┣ 📜rig.json
    ┃ ┣ 📜session.json
    ┃ ┣ 📜subject.json (created during upload to S3, not on VAST)     
@@ -23,7 +23,7 @@ RAW DATA structure on aind/scratch
    ┃     ┣ 🖼️structure_YYYYMMDD_HHMMSS_DMD#.tif
    ┃     ┗ 🖼️structure_YYYYMMDD_HHMMSS_DMD#-REFERENCE.tif
    ┃
-   ┣ 📦slap2_######_YYYY-MM-DD_HH-MM-SS (for experiments, Session ID by Mouse ID and datetime)/ <- this is the folder that will become a data asset on CodeOcean
+   ┣ 📦######_YYYY-MM-DD_HH-MM-SS (for experiments, Session ID by Mouse ID and datetime)/ <- this is the folder that will become a data asset on CodeOcean
    ┃ ┣ 📜rig.json
    ┃ ┣ 📜session.json
    ┃ ┣ 📜subject.json (created during upload to S3, not on VAST)     
@@ -63,7 +63,7 @@ RAW DATA structure on aind/scratch
    ┃       ┣ 🖼️refStack_YYYYMMDD_HHMMSS_DMD#(_CONFIG#).tif
    ┃       ┗ 🖼️refStack_YYYYMMDD_HHMMSS_DMD#(_CONFIG#)-REFERENCE.tif
    ┃
-   ┣ 📦slap2_######_YYYY-MM-DD_HH-MM-SS_slap2_YYYY-MM-DD_HH-MM-SS (first datetime corresponds to the original session data asset, second datetime corresponds to time of starting processing)
+   ┣ 📦######_YYYY-MM-DD_HH-MM-SS_slap2_YYYY-MM-DD_HH-MM-SS (first datetime corresponds to the original session data asset, second datetime corresponds to time of starting processing)
    ┃ ┣ 📜rig.json (carried over from raw data)
    ┃ ┣ 📜session.json (carried over from raw data)
    ┃ ┣ 📜subject.json (carried over from raw data)  
@@ -87,7 +87,7 @@ RAW DATA structure on aind/scratch
    ┃ ┗ 📂qc
    ┃   ┗ ...TBD...
    ┃
-   ┗ 📦slap2_######_YYYY-MM-DD_HH-MM-SS_<processed modality>_YYYY-MM-DD_HH-MM-SS (first datetime corresponds to the original session data asset, second datetime corresponds to time of starting processing)
+   ┗ 📦######_YYYY-MM-DD_HH-MM-SS_<processed modality>_YYYY-MM-DD_HH-MM-SS (first datetime corresponds to the original session data asset, second datetime corresponds to time of starting processing)
      ┣ 📜rig.json (carried over from raw data)
      ┣ 📜session.json (carried over from raw data)
      ┣ 📜subject.json (carried over from raw data)  
