@@ -127,7 +127,7 @@ summaryEroded(~valid) = nan;
 
 skIm(~valid) = nan;
 
-thetaf = getActImPeaks(summaryEroded,params.peakth,params.peakFuncOpt,params.actImHeteroscedasticNoise,params.peakBufferSize);
+thetaf = getActImPeaks(summaryEroded,params.peakth,[],params.peakFuncOpt,params.actImHeteroscedasticNoise,params.peakBufferSize);
 
 P.row = thetaf(:,2);
 P.col = thetaf(:,3);
