@@ -57,11 +57,10 @@ if params.microscope == "SLAP2" || params.poissBasedStdIM
     firstValidFrames = find(any(~nans, [1 2]),500, 'first');
     varIM = var(IMs(:,:,firstValidFrames),0,3,"omitmissing");
     varIM(nanFrac>0.4) = nan;
-    VIF=2;
-    Vb = VIF*prctile(varIM, 10, 'all');
+    Vb = params.VIF*prctile(varIM, 10, 'all');
     varPred = mean(IMb(:,:,firstValidFrames),3,'omitmissing').* mean(vIM(:,:,firstValidFrames),3,'omitmissing');
     selBright = varPred>prctile(varPred(:), 90);
-    Vk = prctile((varIM(selBright)-(Vb/VIF))./varPred(selBright), 10);
+    Vk = prctile((varIM(selBright)-(Vb/params.VIF))./varPred(selBright), 10);
 
     %Highpass filter in time; This must occur before DoG to avoid edge artifacts
     IMf = IMf - IMb; 

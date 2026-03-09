@@ -38,6 +38,7 @@ switch fnName
         params.tau_s = 0.03;             tooltips.tau_s = 'decay time constant of glutamate signal';
         params.tau2_s = 0.15;            tooltips.tau2_s = 'decay time constant of 2nd channel signal at synapses (usually spine calcium)';
         params.poissBasedStdIM = 0;      tooltips.poissBasedStdIM = 'use Poisson model to estimate stdIM';
+        params.VIF = 1;                  tooltips.VIF = 'variance inflation factor for stdIM estimate (Poiss-based only)';
         params.peakth = 3.5;             tooltips.peakth = 'peak identification threshold (actIM z-score)';
         params.peakFuncOpt = 2;             tooltips.peakFuncOpt = 'peak fitting function (1=gaussian, 2=binned gaussian)';
         params.actImHeteroscedasticNoise = 1;             tooltips.actImHeteroscedasticNoise = 'noise in actIM modeled as heteroscedastic';
