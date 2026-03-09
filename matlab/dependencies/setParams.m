@@ -37,7 +37,12 @@ switch fnName
         params.activityChannel = 1;      tooltips.activityChannel = 'the channel of the original tiff image that contains the glutamate signal';
         params.tau_s = 0.03;             tooltips.tau_s = 'decay time constant of glutamate signal';
         params.tau2_s = 0.15;            tooltips.tau2_s = 'decay time constant of 2nd channel signal at synapses (usually spine calcium)';
-        params.maxSynapseDensity = 0.01; tooltips.maxSynapseDensity = 'maximum synapses per pixel';
+        params.poissBasedStdIM = 0;      tooltips.poissBasedStdIM = 'use Poisson model to estimate stdIM';
+        params.VIF = 1;                  tooltips.VIF = 'variance inflation factor for stdIM estimate (Poiss-based only)';
+        params.peakth = 3.5;             tooltips.peakth = 'peak identification threshold (actIM z-score)';
+        params.peakFuncOpt = 2;             tooltips.peakFuncOpt = 'peak fitting function (1=gaussian, 2=binned gaussian)';
+        params.actImHeteroscedasticNoise = 1;             tooltips.actImHeteroscedasticNoise = 'noise in actIM modeled as heteroscedastic';
+        params.peakBufferSize = 0;             tooltips.peakBufferSize = 'number of pixels to mask around each peak';
         params.nParallelWorkers = 12;    tooltips.nWorkers = 'number of parallel workers';
         params.drawUserRois = true;     tooltips.drawUserRois = 'pop up a GUI to annotate user ROIs?';  
         params.motionThresh = 2.5;       tooltips.motionThresh = 'decrease this to be more stringent on motion correction when censoring frames';
