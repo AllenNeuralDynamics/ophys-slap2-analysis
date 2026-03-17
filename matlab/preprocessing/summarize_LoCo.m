@@ -54,7 +54,7 @@ savedr = [dr filesep 'ExperimentSummary'];
 % on CodeOcean /data is read-only and we save to /results
 is_CodeOcean = ~(getenv("CO_CPUS") == "");
 if is_CodeOcean
-    savedr = strrep(savedr, '/data', '/results');
+    savedr = strrep(strrep(savedr, '/data', '/results'), '/scratch', '/results');
 end
 if ~exist(savedr, 'dir')
     mkdir(savedr);
@@ -271,8 +271,10 @@ for DMDix = nDMDs:-1:1
 
     %prune any sources that got clipped by pixel selection process
     keepSources = sum(selPix, [1 2])>5;
-    sources.R = sources.R(keepSources);
-    sources.C = sources.C(keepSources);
+    if k > 0
+        sources.R = sources.R(keepSources);
+        sources.C = sources.C(keepSources);
+    end
     selPix = selPix(:,:,keepSources);
     disp(['Number of sources: ' int2str(sum(keepSources))]);
         
