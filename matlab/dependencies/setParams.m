@@ -76,6 +76,7 @@ switch fnName
         params.overwriteExisting = false; tooltips.overwriteExisting = 'Realign and overwrite any existing files?';
         params.integrationOnly = false; tooltips.integrationOnly = 'Align only on integration superpixels';
         params.saveTiffs = true; tooltips.saveTiffs = 'Save aligned tiff movies';
+        params.parforBatchSize = Inf; tooltips.parforBatchSize = 'Jobs per parfor batch (limits RAM from packed lookup copies). inf = one batch.';
         params.operator = 'Maria Goeppert Mayer';       tooltips.operator = 'person running the analysis';
     case 'stripRegBergamo'
         params.maxshift = 50; tooltips.maxshift = 'Maximum frame offset,in pixels';
