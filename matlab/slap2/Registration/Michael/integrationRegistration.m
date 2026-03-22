@@ -306,8 +306,15 @@ dmdPixelsPerColumn = hLowLevelDataFile.metaData.dmdPixelsPerColumn;
 dmdPixelsPerRow = hLowLevelDataFile.metaData.dmdPixelsPerRow;
 numFastZs = length(hLowLevelDataFile.fastZs);
 
-%%  Calculate log likelihoods and infer motion from MAP
-log_means = log(lookupTable.likelihood_means{DMD_ix} + 1e-8);
+%%  Calculate metric table and infer motion from MAP
+if isfield(aData, 'motionMetric')
+    motionMetric = lower(string(aData.motionMetric));
+    motionMetric = erase(motionMetric, "'");
+else
+    motionMetric = "poisson";
+end
+validMotionMetrics = ["poisson", "correlation"];
+assert(any(motionMetric == validMotionMetrics), ['Unknown motionMetric: ' char(motionMetric)]);
 
 % how much change is allowed in each dimension at each step
 searchRadius = aData.clipShift;
@@ -382,9 +389,16 @@ for DSframeIx = 1:nDSframes
 
     if mean(spCt == 0) > 0.5; continue; end
 
-    % calculate log likelihoods at all shifts
-    [logLikelihoodTable, scalingFactorTable] = poissonLogLikelihoodTable(data, bsxfun(@times, lookupTable.likelihood_means{DMD_ix}, reshape(spCt, [1 1 1 1 length(lookupTable.allSuperPixelIDs{DMD_ix})])), ...
-                                                                        log_means,ySearch,xSearch,zSearch,channels,params.robust);
+    % calculate motion score at all shifts
+    expectedMeans = bsxfun(@times, lookupTable.likelihood_means{DMD_ix}, reshape(spCt, [1 1 1 1 length(lookupTable.allSuperPixelIDs{DMD_ix})]));
+    if motionMetric == "poisson"
+        % log of mean before brightness scale s must use same μ_ref·spCt as expectedMeans (Poisson k·log λ with λ = s·μ_ref·spCt)
+        log_means = log(expectedMeans + 1e-8);
+        [logLikelihoodTable, scalingFactorTable] = poissonLogLikelihoodTable(data, expectedMeans, ...
+                                                                            log_means,ySearch,xSearch,zSearch,channels,params.robust);
+    else
+        [logLikelihoodTable, scalingFactorTable] = correlationLikelihoodTable(data, expectedMeans, ySearch, xSearch, zSearch, channels);
+    end
 
     [loglikelihoodDS(DSframeIx), I] = max(logLikelihoodTable(:));
 

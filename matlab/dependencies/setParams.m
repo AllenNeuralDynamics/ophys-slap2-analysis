@@ -67,6 +67,7 @@ switch fnName
         params.maxshiftXY = 25; tooltips.maxshift = 'Maximum frame offset,in pixels';
         params.maxshiftZ = 10; tooltips.maxshift = 'Maximum frame offset,in pixels';
         params.clipShift = 5; tooltips.clipShift = 'Maximum allowable shift per frame';
+        params.motionMetric = {'''poisson''','''correlation'''}; tooltips.motionMetric = 'Metric for selecting best motion shift';
         params.robust = false; tooltips.robust = 'Use robust likelihood?';
         params.efficientTiffSave = false; tooltips.efficientTiffSave = 'Save Tiffs locally first then transfer?';
         params.tempFileDir = 'C:\temp'; tooltips.tempFileDir = 'Directory for temp files';
