@@ -1,7 +1,7 @@
 function integrationRegistration(fullPathToTrialTable, paramsIn)
 
 if ~nargin
-    [fn, dr] = uigetfile('*trialTable*.mat');
+    [fn, dr] =  uigetfile('*.mat', 'Select a trialTable file', '*trialTable*.mat' );
 else
     [dr, fn, ext] = fileparts(fullPathToTrialTable); fn = [fn ext]; 
 end
@@ -321,7 +321,7 @@ searchRadius = aData.clipShift;
 searchRadiusZ = ceil(searchRadius / 2);
 
 motionDS = nan(nDSframes,3);
-brightnessDS = nan(nDSframes,1);
+brightnessDS = nan(nDSframes,length(channels));
 loglikelihoodDS = nan(nDSframes,1);
 
 % dataMatrix = zeros(length(lookupTable.allSuperPixelIDs{DMD_ix}),nDSframes);
@@ -426,7 +426,7 @@ for DSframeIx = 1:nDSframes
     %     motionDS(DSframeIx,:) = [ySearch(My); xSearch(Mx); zSearch(Mz)] - [lookupTable.yPre+1; lookupTable.xPre+1; lookupTable.zPre{DMD_ix}+1];
     % end
 
-    brightnessDS(DSframeIx) = scalingFactorTable(My, Mx, Mz);
+    brightnessDS(DSframeIx,:) = scalingFactorTable(My, Mx, Mz,:);
     % dataMatrix(:,DSframeIx) = data;
     % expectedMatrix(:,DSframeIx) = brightnessDS(DSframeIx) .* lookupTable.likelihood_means{DMD_ix}(ySearch(My), xSearch(Mx), zSearch(Mz),:);
     
@@ -462,8 +462,8 @@ for DSframeIx = 1:nDSframes
         end
     end
     
-    ySearch = max(1,round(motionDS(DSframeIx,1)+lookupTable.yPre+1) - searchRadius):min(xMotRange,round(motionDS(DSframeIx,1)+lookupTable.yPre+1) + searchRadius);
-    xSearch = max(1,round(motionDS(DSframeIx,2)+lookupTable.xPre+1) - searchRadius):min(yMotRange,round(motionDS(DSframeIx,2)+lookupTable.xPre+1) + searchRadius);
+    ySearch = max(1,round(motionDS(DSframeIx,1)+lookupTable.yPre+1) - searchRadius):min(yMotRange,round(motionDS(DSframeIx,1)+lookupTable.yPre+1) + searchRadius);
+    xSearch = max(1,round(motionDS(DSframeIx,2)+lookupTable.xPre+1) - searchRadius):min(xMotRange,round(motionDS(DSframeIx,2)+lookupTable.xPre+1) + searchRadius);
     zSearch = max(1,round(motionDS(DSframeIx,3)+lookupTable.zPre{DMD_ix}+1) - searchRadiusZ):min(zMotRange,round(motionDS(DSframeIx,3)+lookupTable.zPre{DMD_ix}+1) + searchRadiusZ);
 end
 catch ME
