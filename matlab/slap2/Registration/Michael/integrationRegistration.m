@@ -389,15 +389,19 @@ for DSframeIx = 1:nDSframes
 
     if mean(spCt == 0) > 0.5; continue; end
 
-    % calculate motion score at all shifts
-    expectedMeans = bsxfun(@times, lookupTable.likelihood_means{DMD_ix}, reshape(spCt, [1 1 1 1 length(lookupTable.allSuperPixelIDs{DMD_ix})]));
+    % calculate expected means for the current search subcube
+    nSP = length(lookupTable.allSuperPixelIDs{DMD_ix});
+    subLikelihood = lookupTable.likelihood_means{DMD_ix}(ySearch, xSearch, zSearch, channels, :);
+    expectedMeansSub = bsxfun(@times, subLikelihood, reshape(spCt, [1 1 1 1 nSP]));
+    idxY = 1:numel(ySearch);
+    idxX = 1:numel(xSearch);
+    idxZ = 1:numel(zSearch);
     if motionMetric == "poisson"
-        % log of mean before brightness scale s must use same μ_ref·spCt as expectedMeans (Poisson k·log λ with λ = s·μ_ref·spCt)
-        log_means = log(expectedMeans + 1e-8);
-        [logLikelihoodTable, scalingFactorTable] = poissonLogLikelihoodTable(data, expectedMeans, ...
-                                                                            log_means,ySearch,xSearch,zSearch,channels,params.robust);
+        log_means_sub = log(expectedMeansSub + 1e-8);
+        [logLikelihoodTable, scalingFactorTable] = poissonLogLikelihoodTable(data, expectedMeansSub, log_means_sub, ...
+            idxY, idxX, idxZ, channels, params.robust);
     else
-        [logLikelihoodTable, scalingFactorTable] = correlationLikelihoodTable(data, expectedMeans, ySearch, xSearch, zSearch, channels);
+        [logLikelihoodTable, scalingFactorTable] = correlationLikelihoodTable(data, expectedMeansSub, idxY, idxX, idxZ, channels);
     end
 
     [loglikelihoodDS(DSframeIx), I] = max(logLikelihoodTable(:));
