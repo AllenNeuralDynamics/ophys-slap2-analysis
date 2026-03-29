@@ -108,7 +108,8 @@ if sum(pTmp(:))
     end
 
     fitSupport = (fitIM > 1e-3);
-    explored = resIM .* ~bufferMask .* ~exclusionMask .* fitSupport;
+    rejectMask = false(size(actIM));
+    explored = resIM .* ~bufferMask .* ~exclusionMask .* ~rejectMask .* fitSupport;
     pTmp = zeros(size(explored));
     if any(fitSupport(:)) && max(explored(:)) > peakth
         pTmp = explored == max(explored(:));
@@ -119,8 +120,10 @@ if sum(pTmp(:))
         [pY, pX] = ind2sub(size(pTmp),idxNew);
         amp = actIM(idxNew) .* ampScale;
 
+        nBefore = size(thetaf,1);
         thetaf = [thetaf; [amp, pY, pX, 0.35]];
         pLocs = [pLocs; [pY, pX]];
+        newIdx = nBefore + 1;
 
         CC = bwconncomp(actSelPix);
         for i = 1:CC.NumObjects
@@ -142,6 +145,21 @@ if sum(pTmp(:))
         ub = [Inf*ones(sum(thetaIdxsToFit),1),min(size(actIM,1)+0.5,pLocs(thetaIdxsToFit,1)+1.5),min(size(actIM,2)+0.5,pLocs(thetaIdxsToFit,2)+1.5),5*ones(sum(thetaIdxsToFit),1)];
         lb = [zeros(sum(thetaIdxsToFit),1),max(0.5,pLocs(thetaIdxsToFit,1)-1.5),max(0.5,pLocs(thetaIdxsToFit,2)-1.5),zeros(sum(thetaIdxsToFit),1)];
         thetaf(thetaIdxsToFit,:) = lsqcurvefit(peakFunc,thetaf(thetaIdxsToFit,:),[actSelY,actSelX],actIM(actSelPix)-mu_bg,lb,ub,opts);
+
+        mu_y_new = thetaf(newIdx,2);
+        mu_x_new = thetaf(newIdx,3);
+        if abs(mu_y_new - round(mu_y_new)) < 1e-3 && abs(mu_x_new - round(mu_x_new)) < 1e-3
+            fitMask = thetaIdxsToFit;
+            fitMask(newIdx) = false;
+            if any(fitMask)
+                ub = [Inf*ones(sum(fitMask),1),min(size(actIM,1)+0.5,pLocs(fitMask,1)+1.5),min(size(actIM,2)+0.5,pLocs(fitMask,2)+1.5),5*ones(sum(fitMask),1)];
+                lb = [zeros(sum(fitMask),1),max(0.5,pLocs(fitMask,1)-1.5),max(0.5,pLocs(fitMask,2)-1.5),zeros(sum(fitMask),1)];
+                thetaf(fitMask,:) = lsqcurvefit(peakFunc,thetaf(fitMask,:),[actSelY,actSelX],actIM(actSelPix)-mu_bg,lb,ub,opts);
+            end
+            thetaf(newIdx,:) = [];
+            pLocs(newIdx,:) = [];
+            rejectMask(idxNew) = true;
+        end
         
         pIM = false(size(actIM));
         iy = min(max(round(thetaf(:,2)), 1), size(actIM,1));
@@ -162,7 +180,7 @@ if sum(pTmp(:))
         end
     
         fitSupport = (fitIM > 1e-3);
-        explored = resIM .* ~bufferMask .* ~exclusionMask .* fitSupport;
+        explored = resIM .* ~bufferMask .* ~exclusionMask .* ~rejectMask .* fitSupport;
         pTmp = zeros(size(explored));
         if any(fitSupport(:)) && max(explored(:)) > peakth
             pTmp = explored == max(explored(:));
