@@ -30,13 +30,13 @@ params.k2 = params.k2./sum(params.k2);
 params.baselineWindow_samps =  params.baselineWindow_Glu_s .*params.analyzeHz;
 params.denoiseWindow_samps = params.denoiseWindow_s .* params.analyzeHz;
 
-if ~isfield(params, 'lambda') || isempty(params.lambda)
+if ~isfield(params, 'photonScale') || isempty(params.photonScale)
     switch params.microscope
         case 'SLAP2'
-            params.lambda = 25; % true photon scale in raw measurements is 100, early preprocessing averages down measurements so alters the ideal setting here
+            params.photonScale = 25; % true photon scale in raw measurements is 100, early preprocessing averages down measurements so alters the ideal setting here
         otherwise
-            warning('params.lambda not supplied; extractTrial will estimate it independently for each recording. This may cause trial-to-trial baseline and scaling variations')
-            params.lambda = [];
+            warning('params.photonScale not supplied; extractTrial will estimate it independently for each recording. This may cause trial-to-trial baseline and scaling variations')
+            params.photonScale = [];
     end
 end
 

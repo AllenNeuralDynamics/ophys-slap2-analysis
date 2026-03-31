@@ -4,25 +4,36 @@ Y_obs = double(Y_obs);
 Finv = double(Finv);
 sz = size(selPix);
 
-if isempty(params.lambda) %If not provided, estimate the standard deviation of a dim pixel
-    pxSTD = nan(1,size(Y_obs,1));
-    mY = nan(1,size(Y_obs,1));
-    for pxIx = 1:size(Y_obs,1)
-        [pxSTD(pxIx), mY(pxIx)] = std(Y_obs(pxIx,:,1),1./Finv(pxIx,:),2,'omitmissing');
+if isempty(params.photonScale) %If not provided, estimate the standard deviation of a dim pixel
+    if params.dimStdMethod
+        pxSTD = nan(1,size(Y_obs,1));
+        mY = nan(1,size(Y_obs,1));
+        for pxIx = 1:size(Y_obs,1)
+            [pxSTD(pxIx), mY(pxIx)] = std(Y_obs(pxIx,:,1),1./Finv(pxIx,:),2,'omitmissing');
+        end
+        selDim = mY(:)<prctile(mY,20);
+        params.photonScale = 4*prctile(pxSTD(selDim),90)
+    else
+        pxSTD = nan(1,size(Y_obs,1));
+        mY = nan(1,size(Y_obs,1));
+        for pxIx = 1:size(Y_obs,1)
+            [pxSTD(pxIx), mY(pxIx)] = std(Y_obs(pxIx,:,1),1./Finv(pxIx,:),2,'omitmissing');
+        end
+        Vb = prctile(pxSTD.^2, 5,'all','omitmissing');
+        selBright = mY(:) > prctile(mY, 40,'omitmissing') && mY(:) < prctile(mY, 90,'omitmissing');
+        params.photonScale = prctile((pxSTD(selBright).^2-Vb)./mY(selBright), 10,'omitmissing');
     end
-    sel = mY(:)<prctile(mY,20);
-    params.lambda = 4*prctile(pxSTD(sel),90)
 end
 
 %rescale data
-Y_obs = Y_obs./params.lambda;
+Y_obs = Y_obs./params.photonScale;
 if nargin>5
-    GT.B = GT.B./params.lambda;
-    GT.S = GT.S./params.lambda;
-    GT.X = GT.X./params.lambda;
-    GT.Y = GT.Y./params.lambda;
+    GT.B = GT.B./params.photonScale;
+    GT.S = GT.S./params.photonScale;
+    GT.X = GT.X./params.photonScale;
+    GT.Y = GT.Y./params.photonScale;
 end
-params.lambda = 1; %after the above normalization, setting this higher than 1 (e.g. 2) encourages sparsity of activity
+% params.lambda = 1; %after the above normalization, setting this higher than 1 (e.g. 2) encourages sparsity of activity
 
 %break the problem into separable chunks, i.e. nonoverlap sets
 zones = false(sz); zones(sub2ind(sz,sources.R,sources.C)) = true;
@@ -181,7 +192,7 @@ end
 %initialize B
 params.denoiseWindow_samps = ceil(params.denoiseWindow_s.*params.analyzeHz);
 %denoised = smoothdata(Y_obs,2,"movmean",,'omitmissing');
-B_est = max(params.lambda/10, splitFreq(Y_obs, params.denoiseWindow_samps, ceil(params.baselineWindow_samps/params.denoiseWindow_samps)));
+B_est = max(params.minBaseline, splitFreq(Y_obs, params.denoiseWindow_samps, ceil(params.baselineWindow_samps/params.denoiseWindow_samps)));
 
 %medRes = median(denoised-LP,2);
 typicalX = sqrt(mean((Y_obs(:,1:100)-B_est(:,1:100)).^2,'all'))*ones(num_sources,num_time_points);
@@ -317,7 +328,7 @@ dFls = H_est\(Y_obs-B_est);
 
 if ~isempty(Y2) % two-channel recording, process calcium data with same source footprints
     %fit initial baseline
-    B2 = max(params.lambda/10, splitFreq(Y2, params.denoiseWindow_samps, ceil(params.baselineWindow_samps/params.denoiseWindow_samps)));
+    B2 = max(params.minBaseline, splitFreq(Y2, params.denoiseWindow_samps, ceil(params.baselineWindow_samps/params.denoiseWindow_samps)));
     opts.HessianMultiplyFcn = @(hinfo, v, flag) hessmult_S_wrapper(hinfo, Y2, H_est, B2, params.k2, Finv, params.lambda, v); %hessmult_S_wrapper takes (Svec, Z, H, B, k, F, lambda, v)
     opts.MaxIterations = 15;
     LS2 = H_est\(Y2-B2);
@@ -387,7 +398,7 @@ for pxIx = size(Y,1):-1:1
     resp_scaled = W'.*Y(pxIx,:)';
     
     b = lsqlin(preds_scaled,resp_scaled,[],[],[],[],lb,ub,[],opts);
-    B(pxIx,:) = max(params.lambda/10, (preds(:,(nValid+1):end)*b((nValid+1):end))');
+    B(pxIx,:) = max(params.minBaseline, (preds(:,(nValid+1):end)*b((nValid+1):end))');
 end
 end
 
@@ -649,8 +660,8 @@ function HvS = hessmult_S_wrapper(S, Z, H, B, k, F, lambda, v)
 end
 
 function Xfloor = computeFloor(X, denoiseWindow, baseline)
- ord = ceil(0.1*baseline); % a percentile filter to remove overfit small spikes during iterations
- Xmed = medfilt2(X, [1 2*ceil(denoiseWindow)+1],"symmetric");
- Xmed_min = ordfilt2(Xmed, ord, ones(1,ceil(baseline)), 'symmetric');
- Xfloor = smoothdata(Xmed_min, 2,"movmean",ceil(baseline),"omitmissing");
+    ord = ceil(0.1*baseline); % a percentile filter to remove overfit small spikes during iterations
+    Xmed = medfilt2(X, [1 2*ceil(denoiseWindow)+1],"symmetric");
+    Xmed_min = ordfilt2(Xmed, ord, ones(1,ceil(baseline)), 'symmetric');
+    Xfloor = smoothdata(Xmed_min, 2,"movmean",ceil(baseline),"omitmissing");
 end

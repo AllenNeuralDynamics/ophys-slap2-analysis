@@ -30,7 +30,10 @@ switch fnName
         params.sigma_px = 1.33;          tooltips.sigma_px = 'Estimated radius of the PSF (gaussian sigma)';
         params.nmfIter = 2;              tooltips.nmfIter = 'number of iterations of NMF refinement';
         params.dXY = 3;                  tooltips.dXY = 'how large sources can be (radius), pixels';
-        params.lambda = [];              tooltips.lambda = 'regularizer; roughly the single-photon amplitude. Leave empty to use default/estimate from data.';
+        params.photonScale = [];              tooltips.photonScale = 'roughly the single-photon amplitude. Leave empty to use default/estimate from data.';
+        params.dimStdMethod = false;              tooltips.dimStdMethod = 'use dim pixel std method to estimate photon scale if not provided';
+        params.minBaseline = 1/10;              tooltips.minBaseline = 'minimum baseline for source extraction (normalized photon units)';
+        params.lambda = 1;              tooltips.lambda = 'regularizer for source extraction';
         params.denoiseWindow_s = 0.2;   tooltips.denoiseWindow_s= 'the timescale on which signals can be smoothed when denoising, seconds';
         params.baselineWindow_Glu_s = 4; tooltips.baselineWindow_Glu_s= 'timescale for calculating F0 in glutamate channel, seconds';
         params.baselineWindow_Ca_s = 4;  tooltips.baselineWindow_Ca_s= 'timescale for calculating F0 in calcium channel, seconds';
