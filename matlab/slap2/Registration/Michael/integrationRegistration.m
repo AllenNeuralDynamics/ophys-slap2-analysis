@@ -55,36 +55,9 @@ nDMDs = size(trialTable.filename,1);
 [dixs,fixs] = ndgrid(1:nDMDs,1:length(trialTable.trueTrialIx));
 if params.saveTiffs; fnRegDS = cell(nDMDs,length(trialTable.trueTrialIx)); end
 fnAdata = cell(nDMDs,length(trialTable.trueTrialIx));
-nJobs = numel(fixs);
-if isfield(params, 'parforBatchSize') && ~isempty(params.parforBatchSize)
-    if isinf(params.parforBatchSize(1))
-        batchSize = nJobs;
-    else
-        batchSize = max(1, round(params.parforBatchSize(1)));
-    end
-else
-    batchSize = min(8, nJobs);
-end
-for b0 = 1:batchSize:nJobs
-    batch = b0:min(b0 + batchSize - 1, nJobs);
-    nB = numel(batch);
-    jobLookup = cell(nB, 1);
-    for j = 1:nB
-        jobLookup{j} = packLookupTableForDMD(lookupTable, dixs(batch(j)));
-    end
-    batchFnReg = cell(nB, 1);
-    batchFnAdata = cell(nB, 1);
-    parfor j = 1:nB
-        p_ix = batch(j);
-        f_ix = fixs(p_ix);
-        DMD_ix = dixs(p_ix);
-        [batchFnReg{j}, batchFnAdata{j}] = alignIntegrationAsync(dr, trialTable, jobLookup{j}, params, f_ix, DMD_ix);
-    end
-    for j = 1:nB
-        p_ix = batch(j);
-        fnRegDS{p_ix} = batchFnReg{j};
-        fnAdata{p_ix} = batchFnAdata{j};
-    end
+parfor p_ix = 1:numel(fixs)
+    f_ix = fixs(p_ix); DMD_ix = dixs(p_ix);
+    [fnRegDS{p_ix}, fnAdata{p_ix}]= alignIntegrationAsync(dr, trialTable, lookupTable, params, f_ix, DMD_ix);
 end
 
 params.endTime = char(datetime('now','TimeZone','local','Format','yyyy-MM-dd''T''HH:mm:ss.SSSZZZZZ'));
@@ -275,7 +248,7 @@ save(trialTable.lookupFile,'lookupTable','-v7.3');
 end
 
 
-function [fnwrite, fnAdata] = alignIntegrationAsync(dr, trialTable, lookupDMD, params, f_ix, DMD_ix)
+function [fnwrite, fnAdata] = alignIntegrationAsync(dr, trialTable, lookupTable, params, f_ix, DMD_ix)
 
 fn = trialTable.filename{DMD_ix,f_ix};
 fnW = ['E' int2str(trialTable.epoch(f_ix)) 'T' int2str(f_ix) 'DMD' int2str(DMD_ix) '_INTEGRATION'];
@@ -351,27 +324,27 @@ motionDS = nan(nDSframes,3);
 brightnessDS = nan(nDSframes,length(channels));
 loglikelihoodDS = nan(nDSframes,1);
 
-% dataMatrix = zeros(length(lookupDMD.allSuperPixelIDs),nDSframes);
-% expectedMatrix = zeros(length(lookupDMD.allSuperPixelIDs),nDSframes);
+% dataMatrix = zeros(length(lookupTable.allSuperPixelIDs{DMD_ix}),nDSframes);
+% expectedMatrix = zeros(length(lookupTable.allSuperPixelIDs{DMD_ix}),nDSframes);
 
 if params.saveTiffs
     pixelscale = 4e4; %PIXEL SIZE IN DOTS PER CM; 250nm
     fTIF = Fast_BigTiff_Write(fnwriteTmp,pixelscale,0);
 end
 
-xMotRange = lookupDMD.xPre + lookupDMD.xPost + 1;
-yMotRange = lookupDMD.yPre + lookupDMD.yPost + 1;
-zMotRange = lookupDMD.zPre + lookupDMD.zPost + 1;
+xMotRange = lookupTable.xPre + lookupTable.xPost + 1;
+yMotRange = lookupTable.yPre + lookupTable.yPost + 1;
+zMotRange = lookupTable.zPre{DMD_ix} + lookupTable.zPost{DMD_ix} + 1;
 
 ySearch = 1:yMotRange;
 xSearch = 1:xMotRange;
 zSearch = 1:zMotRange;
 
 % Get unique superpixel IDs and their group memberships
-[~, ~, groupIndices] = unique(lookupDMD.sparseMaskInds(:, 2));
+[~, ~, groupIndices] = unique(lookupTable.sparseMaskInds{DMD_ix}(:, 2));
 
 % Group the pixel indices by superpixel
-splitPixels = accumarray(groupIndices, lookupDMD.sparseMaskInds(:, 1), [], @(x) {x});
+splitPixels = accumarray(groupIndices, lookupTable.sparseMaskInds{DMD_ix}(:, 1), [], @(x) {x});
 
 % Compute the median pixel index for each superpixel
 medianIndices = cellfun(@(x) x(round(length(x)/2)), splitPixels);
@@ -394,8 +367,8 @@ for DSframeIx = 1:nDSframes
     cycleIndices = floor((timeWindow-1) / numLinesPerCycle)+1;
 
     % load data
-    data = zeros(length(lookupDMD.allSuperPixelIDs),numChannels);
-    spCt = zeros(length(lookupDMD.allSuperPixelIDs),1);
+    data = zeros(length(lookupTable.allSuperPixelIDs{DMD_ix}),numChannels);
+    spCt = zeros(length(lookupTable.allSuperPixelIDs{DMD_ix}),1);
     allLineData = hLowLevelDataFile.getLineData(lineIndices, cycleIndices, channels);
     for t = 1:length(allLineData)
         superPixIdxs = hLowLevelDataFile.lineSuperPixelIDs{lineIndices(t)};
@@ -406,7 +379,7 @@ for DSframeIx = 1:nDSframes
         zIdx = hLowLevelDataFile.lineFastZIdxs(lineIndices(t));
 
         spID = superPixIdxs*100 + uint32(zIdx); % make superpixel index with Z plane
-        [~,spIdx] = ismember(spID,lookupDMD.allSuperPixelIDs);
+        [~,spIdx] = ismember(spID,lookupTable.allSuperPixelIDs{DMD_ix});
 
         data(spIdx(spIdx>0),:) = data(spIdx(spIdx>0),:) + single(lineData(spIdx>0,:));
         spCt(spIdx(spIdx>0)) = spCt(spIdx(spIdx>0)) + 1;
@@ -417,8 +390,8 @@ for DSframeIx = 1:nDSframes
     if mean(spCt == 0) > 0.5; continue; end
 
     % calculate expected means for the current search subcube
-    nSP = length(lookupDMD.allSuperPixelIDs);
-    subLikelihood = lookupDMD.likelihood_means(ySearch, xSearch, zSearch, channels, :);
+    nSP = length(lookupTable.allSuperPixelIDs{DMD_ix});
+    subLikelihood = lookupTable.likelihood_means{DMD_ix}(ySearch, xSearch, zSearch, channels, :);
     expectedMeansSub = bsxfun(@times, subLikelihood, reshape(spCt, [1 1 1 1 nSP]));
     idxY = 1:numel(ySearch);
     idxX = 1:numel(xSearch);
@@ -450,16 +423,16 @@ for DSframeIx = 1:nDSframes
         dZ = (1-ratioZ)/(1+ratioZ)/2;
     end
 
-    motionDS(DSframeIx,:) = [ySearch(My)-dY; xSearch(Mx)-dX; zSearch(Mz)-dZ] - [lookupDMD.yPre+1; lookupDMD.xPre+1; lookupDMD.zPre+1];
+    motionDS(DSframeIx,:) = [ySearch(My)-dY; xSearch(Mx)-dX; zSearch(Mz)-dZ] - [lookupTable.yPre+1; lookupTable.xPre+1; lookupTable.zPre{DMD_ix}+1];
     
         % motion = shiftsCenter' + [shifts(rr)-dR shifts(cc)-dC];
     % else %the optimum is at an edge of search range; no superresolution
-    %     motionDS(DSframeIx,:) = [ySearch(My); xSearch(Mx); zSearch(Mz)] - [lookupDMD.yPre+1; lookupDMD.xPre+1; lookupDMD.zPre+1];
+    %     motionDS(DSframeIx,:) = [ySearch(My); xSearch(Mx); zSearch(Mz)] - [lookupTable.yPre+1; lookupTable.xPre+1; lookupTable.zPre{DMD_ix}+1];
     % end
 
     brightnessDS(DSframeIx,:) = scalingFactorTable(My, Mx, Mz,:);
     % dataMatrix(:,DSframeIx) = data;
-    % expectedMatrix(:,DSframeIx) = brightnessDS(DSframeIx) .* lookupDMD.likelihood_means(ySearch(My), xSearch(Mx), zSearch(Mz),:);
+    % expectedMatrix(:,DSframeIx) = brightnessDS(DSframeIx) .* lookupTable.likelihood_means{DMD_ix}(ySearch(My), xSearch(Mx), zSearch(Mz),:);
     
     if params.saveTiffs
         for zIdx = 1:numFastZs
@@ -493,9 +466,9 @@ for DSframeIx = 1:nDSframes
         end
     end
     
-    ySearch = max(1,round(motionDS(DSframeIx,1)+lookupDMD.yPre+1) - searchRadius):min(yMotRange,round(motionDS(DSframeIx,1)+lookupDMD.yPre+1) + searchRadius);
-    xSearch = max(1,round(motionDS(DSframeIx,2)+lookupDMD.xPre+1) - searchRadius):min(xMotRange,round(motionDS(DSframeIx,2)+lookupDMD.xPre+1) + searchRadius);
-    zSearch = max(1,round(motionDS(DSframeIx,3)+lookupDMD.zPre+1) - searchRadiusZ):min(zMotRange,round(motionDS(DSframeIx,3)+lookupDMD.zPre+1) + searchRadiusZ);
+    ySearch = max(1,round(motionDS(DSframeIx,1)+lookupTable.yPre+1) - searchRadius):min(yMotRange,round(motionDS(DSframeIx,1)+lookupTable.yPre+1) + searchRadius);
+    xSearch = max(1,round(motionDS(DSframeIx,2)+lookupTable.xPre+1) - searchRadius):min(xMotRange,round(motionDS(DSframeIx,2)+lookupTable.xPre+1) + searchRadius);
+    zSearch = max(1,round(motionDS(DSframeIx,3)+lookupTable.zPre{DMD_ix}+1) - searchRadiusZ):min(zMotRange,round(motionDS(DSframeIx,3)+lookupTable.zPre{DMD_ix}+1) + searchRadiusZ);
 end
 catch ME
     disp(ME);
@@ -540,20 +513,6 @@ if params.saveTiffs && params.efficientTiffSave
     delete(fnwriteTmp);
 end
 
-end
-
-function lookupDMD = packLookupTableForDMD(lookupTable, DMD_ix)
-% One DMD only — avoids parfor broadcasting the full multi-DMD lookup to every worker.
-lookupDMD = struct();
-lookupDMD.likelihood_means = lookupTable.likelihood_means{DMD_ix};
-lookupDMD.allSuperPixelIDs = lookupTable.allSuperPixelIDs{DMD_ix};
-lookupDMD.sparseMaskInds = lookupTable.sparseMaskInds{DMD_ix};
-lookupDMD.xPre = lookupTable.xPre;
-lookupDMD.xPost = lookupTable.xPost;
-lookupDMD.yPre = lookupTable.yPre;
-lookupDMD.yPost = lookupTable.yPost;
-lookupDMD.zPre = lookupTable.zPre{DMD_ix};
-lookupDMD.zPost = lookupTable.zPost{DMD_ix};
 end
 
 function meta = loadMetadata(datFilename)
