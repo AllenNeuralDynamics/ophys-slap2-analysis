@@ -12,16 +12,16 @@ if isempty(params.photonScale) %If not provided, estimate the standard deviation
             [pxSTD(pxIx), mY(pxIx)] = std(Y_obs(pxIx,:,1),1./Finv(pxIx,:),2,'omitmissing');
         end
         selDim = mY(:)<prctile(mY,20);
-        params.photonScale = 4*prctile(pxSTD(selDim),90)
+        params.photonScale = 4*prctile(pxSTD(selDim),90);
     else
         pxSTD = nan(1,size(Y_obs,1));
         mY = nan(1,size(Y_obs,1));
         for pxIx = 1:size(Y_obs,1)
             [pxSTD(pxIx), mY(pxIx)] = std(Y_obs(pxIx,:,1),1./Finv(pxIx,:),2,'omitmissing');
         end
-        Vb = prctile(pxSTD.^2, 5,'all','omitmissing');
-        selBright = mY(:) > prctile(mY, 40,'omitmissing') && mY(:) < prctile(mY, 90,'omitmissing');
-        params.photonScale = prctile((pxSTD(selBright).^2-Vb)./mY(selBright), 10,'omitmissing');
+        Vb = prctile(pxSTD.^2, 5,'all');
+        selBright = mY(:) > prctile(mY(:), 40) & mY(:) < prctile(mY(:), 90);
+        params.photonScale = prctile((pxSTD(selBright).^2-Vb)./mY(selBright), 10);
     end
 end
 
