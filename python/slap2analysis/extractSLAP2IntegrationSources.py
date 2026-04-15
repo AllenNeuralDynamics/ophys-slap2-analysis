@@ -21,6 +21,15 @@ import pandas as pd
 import subprocess
 from tqdm import tqdm
 import re
+import warnings
+from scipy.sparse.linalg import svds
+
+try:
+    from numba import njit, prange
+
+    _NUMBA_AVAILABLE = True
+except ImportError:
+    _NUMBA_AVAILABLE = False
 
 sys.path.append('C:/Users/michael.xie/Documents/ophys-slap2-analysis/python')
 # sys.path.append(str(Path(__file__).parent.parent))
@@ -62,14 +71,115 @@ def nearest_interp(x, xp, yp):
 def fast_dilation(mask, kernel, iterations=1):
     if kernel is None:
         kernel = np.ones((7, 7), np.uint8)  # Structuring element for XY dilation
-    out = np.empty_like(mask)
-    
-    # Iterate over all but last two dimensions
+    # Fast path for the common 3x3 one-iteration case used in activity-map batching.
+    # This avoids Python loops over (time, z) slices and is substantially faster.
+    if (
+        iterations == 1
+        and kernel.shape == (3, 3)
+        and np.all(kernel)
+    ):
+        m = mask.astype(bool, copy=False)
+        p = np.pad(m, [(0, 0)] * (m.ndim - 2) + [(1, 1), (1, 1)], mode="constant", constant_values=False)
+        out = np.zeros_like(m, dtype=bool)
+        for dr in range(3):
+            for dc in range(3):
+                out |= p[..., dr:dr + m.shape[-2], dc:dc + m.shape[-1]]
+        return out
+
+    out = np.empty_like(mask, dtype=bool)
+
+    # Generic path: iterate over all but last two dimensions.
     leading_shape = mask.shape[:-2]
     for idx in np.ndindex(leading_shape):
-        out[idx] = cv2.dilate(mask[idx].astype(np.uint8, copy=False), kernel, iterations=iterations)
-    
-    return out.astype(bool)
+        out[idx] = cv2.dilate(
+            mask[idx].astype(np.uint8, copy=False),
+            kernel,
+            iterations=iterations,
+        ).astype(bool, copy=False)
+
+    return out
+
+
+if _NUMBA_AVAILABLE:
+    @njit(cache=True)
+    def _median_abs_dev_window_inplace_f32(wv, buf, win):
+        """MAD for one window: median(|x - median(x)|), NaNs omitted."""
+        n = 0
+        for k in range(win):
+            v = wv[k]
+            if not np.isnan(v):
+                buf[n] = float(v)
+                n += 1
+        if n == 0:
+            return np.nan
+        med = np.median(buf[:n])
+        for k in range(n):
+            buf[k] = abs(buf[k] - med)
+        return np.median(buf[:n])
+
+    @njit(parallel=True, cache=True)
+    def _rolling_mad_from_xp_numba(xp, win, out):
+        """Reflect-padded rows ``xp`` shape (b, T+2*pad); ``out`` shape (b, T)."""
+        b = xp.shape[0]
+        T = out.shape[1]
+        for i in prange(b):
+            buf = np.empty(win, dtype=np.float64)
+            for t in range(T):
+                out[i, t] = _median_abs_dev_window_inplace_f32(xp[i, t : t + win], buf, win)
+
+def _rolling_mad_rows_same(rows_bt, win):
+    """Rolling MAD along time (axis=1) for a batch of rows.
+
+    For each (row, time) position, MAD = median(|v - median(v)|) over a length-``win``
+    window. NaNs are ignored via ``nanmedian``. Edges use reflect padding.  ``rows_bt``
+    must be float32, shape ``(b, T)``; returns float32 ``(b, T)``.
+
+    Batching keeps one strided window view shared across rows so ``nanmedian`` runs in
+    large chunks (much faster than one row at a time).
+    """
+    rows_bt = np.asarray(rows_bt, dtype=np.float32, order="C")
+    if rows_bt.ndim != 2:
+        raise ValueError("rows_bt must be 2-D (b, T)")
+    b, T = int(rows_bt.shape[0]), int(rows_bt.shape[1])
+    if b == 0:
+        return np.empty((0, T), dtype=np.float32)
+    if T == 0:
+        return np.empty((b, 0), dtype=np.float32)
+    win = int(win)
+    win = max(1, min(win, T))
+    pad = win // 2
+    # Skip all-NaN rows entirely; avoids expensive nanmedian work and warnings.
+    row_has_data = np.any(np.isfinite(rows_bt), axis=1)
+    out = np.full((b, T), np.nan, dtype=np.float32)
+    if not np.any(row_has_data):
+        return out
+
+    rows_valid = rows_bt[row_has_data]
+    xp = np.pad(rows_valid, ((0, 0), (pad, pad)), mode="reflect")
+    if _NUMBA_AVAILABLE:
+        mad_valid = np.empty((rows_valid.shape[0], T), dtype=np.float32)
+        _rolling_mad_from_xp_numba(xp, win, mad_valid)
+        out[row_has_data] = mad_valid
+        return out
+
+    w = np.lib.stride_tricks.sliding_window_view(xp, win, axis=1)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        med = np.nanmedian(w, axis=2)
+        mad = np.nanmedian(np.abs(w - med[:, :, np.newaxis]), axis=2)
+    out[row_has_data] = mad.astype(np.float32, copy=False)
+    return out
+
+
+def ref_pixs_to_drc(refPixs, dmdPixelsPerColumn, dmdPixelsPerRow):
+    """Map flat reference pixel indices to DMD (depth D, column C, row R) integer indices."""
+    refPixs = np.asarray(refPixs, dtype=np.int64)
+    plane = int(dmdPixelsPerColumn) * int(dmdPixelsPerRow)
+    npc = int(dmdPixelsPerColumn)
+    refD = np.floor_divide(refPixs, plane).astype(np.int32)
+    refC = np.floor_divide(refPixs - refD.astype(np.int64) * plane, npc).astype(np.int32)
+    refR = np.mod(refPixs, npc).astype(np.int32)
+    return refD, refC, refR
 
 def _movmean_nan(x: np.ndarray, window: int) -> np.ndarray:
     """
@@ -361,10 +471,7 @@ def get_high_res_traces(trial_info, DMDix, params, sampFreq, refStack, subsample
 
     uniqueMotionYX = np.unique(uniqueMotion[motIndsToKeep,:2],axis=0)
 
-    refPixs = torch.from_numpy(subsampleMatrixInds[:,0])
-    refD = torch.div(refPixs, (dmdPixelsPerColumn*dmdPixelsPerRow),rounding_mode='floor').int()
-    refC = torch.div((refPixs - refD * (dmdPixelsPerColumn*dmdPixelsPerRow)), dmdPixelsPerColumn, rounding_mode='floor').int()
-    refR = (refPixs % dmdPixelsPerColumn).int()
+    refD, refC, refR = ref_pixs_to_drc(subsampleMatrixInds[:, 0], dmdPixelsPerColumn, dmdPixelsPerRow)
 
     selPixMask = np.zeros((numFastZs,dmdPixelsPerColumn,dmdPixelsPerRow), dtype=bool)
     for i in range(uniqueMotionYX.shape[0]):
@@ -927,10 +1034,7 @@ def main():
 
         nPixels = dmdPixelsPerColumn * dmdPixelsPerRow * numFastZs
 
-        refPixs = torch.from_numpy(subsampleMatrixInds[f'DMD{DMDix+1}'][:,0])
-        refD = torch.div(refPixs, (dmdPixelsPerColumn*dmdPixelsPerRow),rounding_mode='floor').int()
-        refC = torch.div((refPixs - refD * (dmdPixelsPerColumn*dmdPixelsPerRow)), dmdPixelsPerColumn, rounding_mode='floor').int()
-        refR = (refPixs % dmdPixelsPerColumn).int()
+        refD, refC, refR = ref_pixs_to_drc(subsampleMatrixInds[f'DMD{DMDix+1}'][:, 0], dmdPixelsPerColumn, dmdPixelsPerRow)
 
         filterSize = psf[f'DMD{DMDix+1}'].shape[0]*psf[f'DMD{DMDix+1}'].shape[1]
         
@@ -941,8 +1045,8 @@ def main():
             tmpMap[:] = np.nan
 
             tmpMap[refD[spIdx],
-                    refR[spIdx].int()-psf[f'DMD{DMDix+1}'].shape[0]//2:refR[spIdx].int()+psf[f'DMD{DMDix+1}'].shape[0]//2+1,
-                    refC[spIdx].int()-psf[f'DMD{DMDix+1}'].shape[1]//2:refC[spIdx].int()+psf[f'DMD{DMDix+1}'].shape[1]//2+1] = torch.from_numpy(psf[f'DMD{DMDix+1}'])
+                    int(refR[spIdx])-psf[f'DMD{DMDix+1}'].shape[0]//2:int(refR[spIdx])+psf[f'DMD{DMDix+1}'].shape[0]//2+1,
+                    int(refC[spIdx])-psf[f'DMD{DMDix+1}'].shape[1]//2:int(refC[spIdx])+psf[f'DMD{DMDix+1}'].shape[1]//2+1] = torch.from_numpy(psf[f'DMD{DMDix+1}'])
 
             sparseHInds[0,spIdx*filterSize:(spIdx+1)*filterSize] = subsampleMatrixInds[f'DMD{DMDix+1}'][spIdx,1] - 1
             sparseHInds[1,spIdx*filterSize:(spIdx+1)*filterSize] = np.where(~np.isnan(tmpMap.flatten()))[0]
@@ -971,15 +1075,15 @@ def main():
         
         if os.path.exists(data_file):
             print(f'Loading existing low resolution data from {data_file}')
-            data_arrays = np.load(data_file)
-            lowResData = data_arrays['lowResData']
-            lowResDataCt = data_arrays['lowResDataCt'] 
-            lowResMotionR = data_arrays['lowResMotionR']
-            lowResMotionC = data_arrays['lowResMotionC']
-            lowResMotionZ = data_arrays['lowResMotionZ']
-            lowResTrialID = data_arrays['lowResTrialID']
-            lowResData2 = data_arrays['lowResData2']
-            lowResDataCt2 = data_arrays['lowResDataCt2']
+            with np.load(data_file) as data_arrays:
+                lowResData = data_arrays['lowResData']
+                lowResDataCt = data_arrays['lowResDataCt'] 
+                lowResMotionR = data_arrays['lowResMotionR']
+                lowResMotionC = data_arrays['lowResMotionC']
+                lowResMotionZ = data_arrays['lowResMotionZ']
+                lowResTrialID = data_arrays['lowResTrialID']
+                lowResData2 = data_arrays['lowResData2']
+                lowResDataCt2 = data_arrays['lowResDataCt2']
         else:
             with mp.Pool(processes=min(params['max_workers'],min(mp.cpu_count(),len(trial_info)))) as pool:
                 results = list(pool.imap(get_trial_data_partial, trial_info))
@@ -1007,86 +1111,211 @@ def main():
             np.savez(data_file, **data_arrays)
             print(f'Saved low resolution data to {data_file}')
 
+        return
+
         lowResDataNorm = lowResData / lowResDataCt
         lowResData2Norm = lowResData2 / lowResDataCt2
-        del lowResData, lowResDataCt, lowResData2, lowResDataCt2
+        vIM = 1 / lowResDataCt
+        del lowResData, lowResData2, lowResDataCt, lowResDataCt2
         
         uniqueMotion, motInds = np.unique(np.round(np.concatenate((lowResMotionR,lowResMotionC,lowResMotionZ),axis=1)),axis=0,return_inverse=True)
-        motIndsToKeep = (np.bincount(motInds) > 100).nonzero()[0]
+        # Calculate the median from the full lowResMotionZ array, then filter uniqueMotion directly
+        median_z = np.median(lowResMotionZ)
+        # Boolean mask: True if within 1.5 um from median Z and has >100 frames
+        bin_counts = np.bincount(motInds, minlength=uniqueMotion.shape[0])
+        keep_mask = (np.abs(uniqueMotion[:, 2] - median_z) <= 1.5) & (bin_counts > 100)
+        motIndsToKeep = np.nonzero(keep_mask)[0]
+
+        framesToKeep = np.isin(motInds, motIndsToKeep)
+
+        # after filtering out frames with large Z motion, we can consider there to be no Z motion in the remaining frames
 
         mean_im = np.full((2,numFastZs,dmdPixelsPerColumn,dmdPixelsPerRow), np.nan, dtype=np.float32)
         most_common_mot = np.argmax(np.bincount(motInds))
-        mean_im[0,refD,refR + int(uniqueMotion[most_common_mot,0]),refC + int(uniqueMotion[most_common_mot,1])] = np.nanmean(lowResDataNorm, axis=1)
-        mean_im[1,refD,refR + int(uniqueMotion[most_common_mot,0]),refC + int(uniqueMotion[most_common_mot,1])] = np.nanmean(lowResData2Norm, axis=1)
+        mean_im[0,refD,refR + int(uniqueMotion[most_common_mot,0]),refC + int(uniqueMotion[most_common_mot,1])] = np.nanmean(lowResDataNorm[:,framesToKeep], axis=1)
+        mean_im[1,refD,refR + int(uniqueMotion[most_common_mot,0]),refC + int(uniqueMotion[most_common_mot,1])] = np.nanmean(lowResData2Norm[:,framesToKeep], axis=1)
         del lowResData2Norm
 
-        uniqueMotionYX = np.unique(uniqueMotion[motIndsToKeep,:2],axis=0)
-        uniqueMotionZ = np.unique(uniqueMotion[motIndsToKeep,2],axis=0)
+        motIndsYX = -1*np.ones((len(motInds),), dtype=np.int32)
+        uniqueMotionToKeepYX, motIndsYX[framesToKeep] = np.unique(np.round(np.concatenate((lowResMotionR,lowResMotionC),axis=1)[framesToKeep,:]),axis=0,return_inverse=True)
 
         selPixMask = np.zeros((numFastZs,dmdPixelsPerColumn,dmdPixelsPerRow), dtype=bool)
-        for i in range(uniqueMotionYX.shape[0]):
-            selPixMask[refD,refR + int(uniqueMotionYX[i,0]),refC + int(uniqueMotionYX[i,1])] = True
+        for i in range(len(uniqueMotionToKeepYX)):
+            selPixMask[refD,refR + int(uniqueMotionToKeepYX[i,0]),refC + int(uniqueMotionToKeepYX[i,1])] = True
         selPixMask = ndimage.binary_dilation(selPixMask, structure=np.ones((1,psf[f'DMD{DMDix+1}'].shape[0],psf[f'DMD{DMDix+1}'].shape[1]), dtype=bool))
         selPixIdxs = np.flatnonzero(selPixMask)
 
         # Get pixel coordinates for selected pixels
-        pixel_coords = np.zeros((len(selPixIdxs), 3), dtype=np.int32)  # [z, y, x] coordinates
-        for i, pixel_idx in enumerate(selPixIdxs):
-            # Convert linear index to 3D coordinates
-            z = pixel_idx // (dmdPixelsPerColumn * dmdPixelsPerRow)
-            remainder = pixel_idx % (dmdPixelsPerColumn * dmdPixelsPerRow)
-            y = remainder // dmdPixelsPerRow
-            x = remainder % dmdPixelsPerRow
-            pixel_coords[i] = [z, y, x]
+        # [z, y, x] coordinates, TODO: should update the name to selPixCoords
+        pixel_coords = np.empty((len(selPixIdxs), 3), dtype=np.int32)
+        pixel_coords[:,0] = selPixIdxs // (dmdPixelsPerColumn * dmdPixelsPerRow)
+        remainder = selPixIdxs % (dmdPixelsPerColumn * dmdPixelsPerRow)
+        pixel_coords[:,1] = remainder // dmdPixelsPerRow
+        pixel_coords[:,2] = remainder % dmdPixelsPerRow
         
         # Convert to torch tensor
         pixel_coords_tensor = torch.tensor(pixel_coords, dtype=torch.float32)
-
-        # seed sources
-        psf_shape = psf[f'DMD{DMDix+1}'].shape
-        psf_center = (psf_shape[0] // 2, psf_shape[1] // 2)
         
         # Convert PSF to torch tensor and extract values where valid
         psf_tensor = torch.from_numpy(psf[f'DMD{DMDix+1}']).float()
         psf_tensor = psf_tensor / torch.sum(psf_tensor)
 
-        # Create expanded PSF with 5x resolution, maintaining center alignment
-        ex_fac = 5
-        psf_tensor_expanded = torch.zeros((psf_shape[0]*ex_fac, psf_shape[1]*ex_fac), dtype=torch.float32)
-
+        # ----- Create expanded PSF with 5x resolution, maintaining center alignment -----
+        ex_fac = 2
+        psf_shape = psf[f'DMD{DMDix+1}'].shape
+        psf_center = (psf_shape[0] // 2, psf_shape[1] // 2)
+        psf_tensor_expanded = torch.zeros((psf_shape[0]*ex_fac, psf_shape[1]*ex_fac), dtype=torch.float32) # TODO: consider whether to keep expanded PSF
         # Calculate center points
         expanded_center_y = (psf_shape[0]*ex_fac - 1) / 2
         expanded_center_x = (psf_shape[1]*ex_fac - 1) / 2
-
         # Create coordinate grids centered around zero
         orig_y = torch.linspace(-expanded_center_y, expanded_center_y, psf_shape[0])
         orig_x = torch.linspace(-expanded_center_x, expanded_center_x, psf_shape[1])
         expanded_y = torch.linspace(-expanded_center_y, expanded_center_y, psf_shape[0]*ex_fac)
         expanded_x = torch.linspace(-expanded_center_x, expanded_center_x, psf_shape[1]*ex_fac)
-
         # Interpolate PSF values while maintaining center alignment
         interp_spline = RectBivariateSpline(orig_y.numpy(), orig_x.numpy(), psf_tensor.numpy())
         psf_tensor_expanded = torch.from_numpy(interp_spline(expanded_y.numpy(), expanded_x.numpy())).float()
-
         # Normalize expanded PSF
         psf_tensor_expanded = psf_tensor_expanded / torch.sum(psf_tensor_expanded)
         psf_shape_expanded = psf_tensor_expanded.shape
         psf_center_expanded = (psf_shape_expanded[0] // 2, psf_shape_expanded[1] // 2)
 
+        # build D matrices for each plane (convolution matrix for PSF)
         D = [None] * numFastZs
         D_expanded = [None] * numFastZs
         interp_data = np.full((selPixIdxs.shape[0],lowResDataNorm.shape[1]), np.nan, dtype=np.float32)
+        plane_size = dmdPixelsPerColumn * dmdPixelsPerRow
+        sel_pix_z = selPixIdxs // plane_size
+        sel_pix_remainder = selPixIdxs % plane_size
+        z_sel_indices = [np.flatnonzero(sel_pix_z == z) for z in range(numFastZs)]
+        refD_z_indices = [np.flatnonzero(refD == z) for z in range(numFastZs)]
+
+        # interp data is for estimating background fluorescence
+        def build_interp_data(data, refR, refC, sel_pixels_2d,
+                        H=800, W=1280, dtype=np.float32):
+            # ---- normalize dtypes once
+            refR = np.asarray(refR, dtype=np.int32)
+            refC = np.asarray(refC, dtype=np.int32)
+            data = np.asarray(data, dtype=dtype)
+
+            r0 = int(max(0, refR.min()) + uniqueMotionToKeepYX[:, 0].min())
+            r1 = int(min(H, refR.max()) + uniqueMotionToKeepYX[:, 0].max())
+            c0 = int(max(0, refC.min()) + uniqueMotionToKeepYX[:, 1].min())
+            c1 = int(min(W, refC.max()) + uniqueMotionToKeepYX[:, 1].max())
+
+            out = np.full((sel_pixels_2d.shape[0], data.shape[1]), np.nan, dtype=dtype)
+
+            # Cache selected pixels by column once.
+            sel_cols = sel_pixels_2d[:, 1]
+            sel_rows = sel_pixels_2d[:, 0]
+            unique_sel_cols = np.unique(sel_cols)
+            selPixIdxs_by_col_all = {int(c): np.flatnonzero(sel_cols == c) for c in unique_sel_cols}
+
+            # ---- frames per motion bucket (avoid (motInds==idx) every time)
+            frames_by_motion = [np.flatnonzero(motIndsYX == idx) for idx in range(len(uniqueMotionToKeepYX))]
+
+            for m_idx, frames in enumerate(frames_by_motion):
+                if frames.size == 0:
+                    continue
+
+                # shift once per motion group
+                sR = refR + int(uniqueMotionToKeepYX[m_idx, 0])
+                sC = refC + int(uniqueMotionToKeepYX[m_idx, 1])
+
+                # columns that actually land in our window and have any samples
+                in_win = (sR >= r0) & (sR <= r1) & (sC >= c0) & (sC <= c1)
+                if not np.any(in_win):
+                    continue
+                cols = np.unique(sC[in_win])
+
+                rows_by_col = {}
+                idxs_by_col = {}
+                single_points = []
+
+                for c in cols:
+                    c_int = int(c)
+                    if c_int not in selPixIdxs_by_col_all:
+                        continue
+                    mask = (sC == c)
+                    data_ix = np.flatnonzero(mask)
+                    if data_ix.size == 1:
+                        rr = int(sR[data_ix[0]])
+                        col_sel = selPixIdxs_by_col_all[c_int]
+                        rr_match = col_sel[sel_rows[col_sel] == rr]
+                        if rr_match.size > 0 and (r0 <= rr <= r1):
+                            single_points.append((rr_match, int(data_ix[0])))
+                        continue
+
+                    rows = sR[data_ix]
+                    order = rows.argsort(kind="mergesort")
+                    rows_by_col[c_int] = rows[order]
+                    idxs_by_col[c_int] = data_ix[order]
+
+                # Interpolate per column, but batch all frames in this motion bucket.
+                for c_int, rows in rows_by_col.items():
+                    colSelPixIdxs = selPixIdxs_by_col_all[c_int]
+                    target_rows = sel_rows[colSelPixIdxs]
+                    src_idx = idxs_by_col[c_int]
+
+                    # Vectorized linear interpolation with NaN outside range.
+                    pos = np.searchsorted(rows, target_rows, side='left')
+                    in_bounds = pos < rows.size
+                    exact = np.zeros_like(pos, dtype=bool)
+                    exact[in_bounds] = rows[pos[in_bounds]] == target_rows[in_bounds]
+
+                    if np.any(exact):
+                        exact_rows = np.flatnonzero(exact)
+                        exact_src = src_idx[pos[exact]]
+                        out[np.ix_(colSelPixIdxs[exact_rows], frames)] = data[exact_src][:, frames]
+
+                    lo = pos - 1
+                    hi = pos
+                    interp_mask = (~exact) & (lo >= 0) & (hi < rows.size)
+                    if not np.any(interp_mask):
+                        continue
+
+                    interp_rows = np.flatnonzero(interp_mask)
+                    lo_v = lo[interp_mask]
+                    hi_v = hi[interp_mask]
+                    row_lo = rows[lo_v].astype(dtype, copy=False)
+                    row_hi = rows[hi_v].astype(dtype, copy=False)
+                    denom = row_hi - row_lo
+                    nonzero = denom != 0
+                    if not np.any(nonzero):
+                        continue
+
+                    interp_rows = interp_rows[nonzero]
+                    lo_v = lo_v[nonzero]
+                    hi_v = hi_v[nonzero]
+                    row_lo = row_lo[nonzero]
+                    row_hi = row_hi[nonzero]
+                    alpha = ((target_rows[interp_rows].astype(dtype) - row_lo) / (row_hi - row_lo))[:, None]
+
+                    vals_lo = data[src_idx[lo_v]][:, frames]
+                    vals_hi = data[src_idx[hi_v]][:, frames]
+                    out[np.ix_(colSelPixIdxs[interp_rows], frames)] = (1.0 - alpha) * vals_lo + alpha * vals_hi
+
+                # Keep single points (no interpolation), like original behavior.
+                for rr_match, src_pos in single_points:
+                    out[np.ix_(rr_match, frames)] = data[src_pos, frames]
+
+            return out, (r0, r1), (c0, c1)
 
         for z in tqdm(range(numFastZs),desc='Computing D matrices for each plane'):
-            zMask = selPixIdxs // (dmdPixelsPerColumn * dmdPixelsPerRow) == z
+            z_idxs = z_sel_indices[z]
+            if z_idxs.size == 0:
+                D[z] = torch.zeros((0, 0), dtype=torch.float32)
+                D_expanded[z] = torch.zeros((0, 0), dtype=torch.float32)
+                continue
 
             # Pre-allocate result matrix
-            D[z] = torch.zeros((len(selPixIdxs[zMask]), len(selPixIdxs[zMask])), dtype=torch.float32)
+            D[z] = torch.zeros((z_idxs.size, z_idxs.size), dtype=torch.float32)
 
             # Convert selected pixel indices to 2D coordinates (vectorized)
             sel_pixels_2d = np.column_stack([
-                    (selPixIdxs[zMask] % (dmdPixelsPerColumn * dmdPixelsPerRow)) // dmdPixelsPerRow,  # rows
-                    (selPixIdxs[zMask] % (dmdPixelsPerColumn * dmdPixelsPerRow)) % dmdPixelsPerRow    # cols
+                    sel_pix_remainder[z_idxs] // dmdPixelsPerRow,  # rows
+                    sel_pix_remainder[z_idxs] % dmdPixelsPerRow    # cols
                 ])
 
             # Vectorized computation using broadcasting
@@ -1115,205 +1344,245 @@ def main():
 
             D_expanded[z][valid_mask_expanded] = psf_tensor_expanded[rel_rows_expanded[valid_mask_expanded], rel_cols_expanded[valid_mask_expanded]]
 
-            def build_interp_data(data, refR, refC, uniqueMotion, motInds,
-                            H=800, W=1280, dtype=np.float32):
-                # ---- normalize dtypes once
-                refR = np.asarray(refR, dtype=np.int32)
-                refC = np.asarray(refC, dtype=np.int32)
-                uniqueMotion = np.asarray(uniqueMotion, dtype=np.int32)
+            ref_z_idxs = refD_z_indices[z]
+            interp_data[z_idxs], _, _ = build_interp_data(lowResDataNorm[ref_z_idxs], refR[ref_z_idxs], refC[ref_z_idxs], sel_pixels_2d)
 
-                # ---- compute windows once (mirrors your logic)
-                windowR = [max(0, refR.min()) + uniqueMotion[:,0].min(),
-                        min(H, refR.max()) + uniqueMotion[:,0].max()]
-                windowC = [max(0, refC.min()) + uniqueMotion[:,1].min(),
-                        min(W, refC.max()) + uniqueMotion[:,1].max()]
-                r0, r1 = int(windowR[0]), int(windowR[1])
-                c0, c1 = int(windowC[0]), int(windowC[1])
+        baseline_window = int(params['alignHz'][f'DMD{DMDix+1}'] * params['baselineWindow_s'])
+        valid = ~np.isnan(interp_data)
+        np.nan_to_num(interp_data, copy=False, nan=0.0)
 
-                out = np.full((sel_pixels_2d.shape[0],data.shape[1]), np.nan, dtype=dtype)
+        # Use running means and scale to window sums for a faster NaN-aware baseline.
+        sum_vals = ndimage.uniform_filter1d(interp_data, size=baseline_window, axis=1, mode='nearest') * baseline_window
+        valid_f = valid.astype(np.float32, copy=False)
+        count_vals = ndimage.uniform_filter1d(valid_f, size=baseline_window, axis=1, mode='nearest') * baseline_window
 
-                # ---- frames per motion bucket (avoid (motInds==idx) every time)
-                frames_by_motion = {idx: np.flatnonzero(motInds == idx) for idx in np.unique(motInds)}
+        interp_data_background = np.empty_like(sum_vals, dtype=interp_data.dtype)
+        interp_data_background.fill(np.nan)
+        _ = np.divide(sum_vals, count_vals, out=interp_data_background, where=count_vals > 0)
 
-                for m_idx in np.unique(motInds):
-                    frames = frames_by_motion.get(m_idx)
-                    if frames is None or frames.size == 0:
-                        continue
+        del sum_vals, count_vals, valid_f
 
-                    # shift once per motion group
-                    dR, dC = int(uniqueMotion[m_idx, 0]), int(uniqueMotion[m_idx, 1])
-                    sR = refR + dR
-                    sR = sR.astype(np.int32, copy=False)
-                    sC = refC + dC
-                    sC = sC.astype(np.int32, copy=False)
-
-                    # columns that actually land in our window and have any samples
-                    in_win = (sR >= r0) & (sR <= r1) & (sC >= c0) & (sC <= c1)
-                    if not np.any(in_win):
-                        continue
-                    cols = np.unique(sC[in_win])
-
-                    # ---- precompute per-column row positions and 1D data indices (sorted by row)
-                    rows_by_col = {}
-                    idxs_by_col = {}
-                    selPixIdxs_by_col = {}
-                    single_point = []  # track columns with only one sample (no interpolation)
-                    remaining_cols = np.unique(sel_pixels_2d[:,1])
-                    for c in cols:
-                        mask = (sC == c)
-                        nnz = mask.sum()
-                        if nnz < 2:
-                            if nnz == 1:
-                                single_point.append(int(c))
-                            cols = np.delete(cols, np.flatnonzero(cols == c))
-                            continue
-                        rows = sR[mask]
-                        data_ix = np.flatnonzero(mask)
-                        order = rows.argsort(kind="mergesort")
-                        rows_by_col[int(c)] = rows[order]
-                        idxs_by_col[int(c)]  = data_ix[order]
-                        selPixIdxs_by_col[int(c)] = np.flatnonzero(sel_pixels_2d[:,1] == c)
-                        remaining_cols = np.delete(remaining_cols, np.flatnonzero(remaining_cols == c))
-                    
-                    closest_col = [None] * len(remaining_cols)
-                    for i, c in enumerate(remaining_cols):
-                        closest_col[i] = cols[np.argmin(np.abs(cols - c))]
-                        selPixIdxs_by_col[int(c)] = np.flatnonzero(sel_pixels_2d[:,1] == c)
-                        selPixIdxs_by_col[int(c)] = selPixIdxs_by_col[int(c)][np.isin(sel_pixels_2d[selPixIdxs_by_col[int(c)],0],sel_pixels_2d[selPixIdxs_by_col[int(closest_col[i])],0])]
-
-                    # ---- fill frames in this motion bucket
-                    for f in frames:
-                        yvec = data[:, f].astype(dtype, copy=False)
-
-                        # interpolate only columns that have >= 2 samples
-                        for c, rows in rows_by_col.items():
-                            vals = yvec[idxs_by_col[c]]
-                            colSelPixIdxs = selPixIdxs_by_col[c]
-                            # interpolate just within our row window; outside stays NaN
-                            out[colSelPixIdxs, f] = np.interp(sel_pixels_2d[colSelPixIdxs,0], rows, vals, left=vals[0], right=vals[-1])
-
-                        for i, c in enumerate(remaining_cols):
-                            closest_col_idx_mask = np.isin(sel_pixels_2d[selPixIdxs_by_col[closest_col[i]],0],sel_pixels_2d[selPixIdxs_by_col[c],0])
-                            out[selPixIdxs_by_col[c], f] = out[selPixIdxs_by_col[closest_col[i]][closest_col_idx_mask], f]
-
-                        # keep single points (no interpolation), like your original code
-                        for c in single_point:
-                            # (exact row/val for that one sample)
-                            pos = np.flatnonzero((sC == c))[0]
-                            rr = sR[pos]
-                            if r0 <= rr <= r1:
-                                out[np.flatnonzero((sel_pixels_2d[:,1] == c) & (sel_pixels_2d[:,0] == rr)), f] = yvec[pos]
-
-                # out has shape: (n_frames, r1-r0+1, c1-c0+1), same as your bg_frame slice
-                return out, (r0, r1), (c0, c1)
-        
-            interp_data[zMask], _, _ = build_interp_data(lowResDataNorm[refD == z], refR[refD == z], refC[refD == z], uniqueMotion, motInds)
-
-        baseline_window = int(params['alignHz'][f'DMD{DMDix+1}']*params['baselineWindow_s'])
-        nan_mask = np.isnan(interp_data)
-        interp_data[nan_mask] = np.nanmedian(interp_data[~nan_mask])
-        interp_data_background = ndimage.uniform_filter1d(interp_data, size=baseline_window, axis=1, mode='nearest')
-        interp_data_background[nan_mask] = np.nan
+        # interp_data[nan_mask] = np.nanmedian(interp_data[~nan_mask])
+        # interp_data_background = ndimage.uniform_filter1d(interp_data, size=baseline_window, axis=1, mode='nearest')
+        # interp_data_background[nan_mask] = np.nan
 
         del interp_data
             
         background = np.full_like(lowResDataNorm, np.nan, dtype=np.float32)
         
-        for motion_idx in tqdm(np.unique(motInds),desc='Computing background for all motion indices'):
-            motion_frames = (motInds == motion_idx).nonzero()[0]
-            dR, dC = int(uniqueMotion[motion_idx, 0]), int(uniqueMotion[motion_idx, 1])
+        for motion_idx in tqdm(range(len(uniqueMotionToKeepYX)),desc='Computing background for all motion indices'):
+            motion_frames = np.flatnonzero(motIndsYX == motion_idx)
+            dR, dC = int(uniqueMotionToKeepYX[motion_idx, 0]), int(uniqueMotionToKeepYX[motion_idx, 1])
             sD = refD
             sR = refR + dR
             sC = refC + dC
 
             shifted_indices = sD * (dmdPixelsPerColumn * dmdPixelsPerRow) + sR * dmdPixelsPerRow + sC
-            
-            # Vectorized operation: create mapping from selPixIdxs to shifted positions
-            # This avoids creating the full 800*1280 array for each frame
-            for f in motion_frames:
-                # Create sparse mapping directly
-                bg_values = interp_data_background[:, f]
-                # Map selected pixel values to their shifted positions
-                background[:, f] = bg_values[np.searchsorted(selPixIdxs, shifted_indices)]
 
-        residual = lowResDataNorm - background
+            # Build shifted->selected pixel mapping once per motion index.
+            bg_idxs = np.searchsorted(selPixIdxs, shifted_indices)
+            idxs_mask = bg_idxs < selPixIdxs.size
+            idxs_mask[idxs_mask] &= (selPixIdxs[bg_idxs[idxs_mask]] == shifted_indices[idxs_mask])
+
+            if np.any(idxs_mask):
+                # Fill all frames for this motion index in one shot.
+                valid_rows = np.flatnonzero(idxs_mask)
+                background[np.ix_(valid_rows, motion_frames)] = interp_data_background[np.ix_(bg_idxs[valid_rows], motion_frames)]
+
+        # nan_mask = np.isnan(background)
+        # # Impute NaN values using low-rank matrix completion (soft-impute)
+        # # Initialize NaN values with global mean
+        # global_mean = np.nanmean(background)
+        # background_imputed = background.copy()
+        # background_imputed[nan_mask] = global_mean
+        
+        # # Iterative soft-impute algorithm for matrix completion
+        # max_iter = 20
+        # rank = min(50, min(background.shape) - 1)
+        # tol = 1e-4
+        
+        # for iter_idx in tqdm(range(max_iter), desc='Imputing background'):
+        #     background_old = background_imputed.copy()
+            
+        #     # Truncated SVD on current estimate (much faster for large matrices)
+        #     U, s, Vt = svds(background_imputed, k=rank)
+            
+        #     # Sort by descending singular values (svds returns ascending order)
+        #     idx = np.argsort(s)[::-1]
+        #     U = U[:, idx]
+        #     s = s[idx]
+        #     Vt = Vt[idx, :]
+            
+        #     # Reconstruct with truncated rank
+        #     background_approx = U @ np.diag(s) @ Vt
+            
+        #     # Update only the missing values (keep observed values fixed)
+        #     background_imputed[nan_mask] = background_approx[nan_mask]
+            
+        #     # Check convergence
+        #     change = np.linalg.norm(background_imputed[nan_mask] - background_old[nan_mask])
+        #     if change < tol * np.linalg.norm(background_imputed[nan_mask]):
+        #         print(f"Converged at iteration {iter_idx+1} with change: {change:.8f}")
+        #         break
+        # background = background_imputed
+
+        # del background_imputed, background_old, U, s, Vt, background_approx
+
+        residualRaw = lowResDataNorm - background
+        residual = residualRaw / ((background+0.5) * vIM)
         del interp_data_background
 
-        decayTau_frames = params['decayTau_s']*params['alignHz'][f'DMD{DMDix+1}']
-        decay_kernel = np.exp(np.linspace(-np.ceil(decayTau_frames*3),0,int(np.ceil(decayTau_frames*3)+1))/decayTau_frames)
-        residualFilt = signal.convolve2d(residual,np.expand_dims(decay_kernel / np.sum(decay_kernel),0),mode='same')
-        # data_for_nmf = torch.from_numpy(data_for_nmf.astype(np.float32))
-
         # precompute H matrices
-        H_mots = [None] * len(motIndsToKeep)
-        for i, motion_idx in enumerate(motIndsToKeep):
-            sparseHIndsShifted = sparseHInds.copy()
-            sparseHIndsShifted[1,:] = sparseHIndsShifted[1,:] + uniqueMotion[motion_idx,0].astype(int, copy=False) * dmdPixelsPerRow + uniqueMotion[motion_idx,1].astype(int, copy=False)
-
-            sparseHIndsShiftedSelPix = sparseHIndsShifted.copy()
-            sparseHIndsShiftedSelPix[1] = np.searchsorted(selPixIdxs,sparseHIndsShifted[1])
-            H_mots[i] = torch.sparse_coo_tensor(sparseHIndsShiftedSelPix,sparseHVals,(numSuperPixels,selPixIdxs.shape[0]),dtype=torch.float32)
+        H_mots = [None] * len(uniqueMotionToKeepYX)
+        base_sparse_rows = sparseHInds[0]
+        base_sparse_cols = sparseHInds[1]
+        motion_shifts = (
+            uniqueMotionToKeepYX[:, 0].astype(np.int64, copy=False) * dmdPixelsPerRow
+            + uniqueMotionToKeepYX[:, 1].astype(np.int64, copy=False)
+        )
+        sparseHIndsShiftedSelPix = np.empty((2, base_sparse_cols.shape[0]), dtype=np.int64)
+        sparseHIndsShiftedSelPix[0] = base_sparse_rows
+        for i, pix_shift in enumerate(motion_shifts):
+            shifted_cols = base_sparse_cols + pix_shift
+            sparseHIndsShiftedSelPix[1] = np.searchsorted(selPixIdxs, shifted_cols)
+            H_mots[i] = torch.sparse_coo_tensor(
+                sparseHIndsShiftedSelPix,
+                sparseHVals,
+                (numSuperPixels, selPixIdxs.shape[0]),
+                dtype=torch.float32,
+            )
         
-        # Pre-compute sparse matrix multiplications with D for all motion indices
-        HD_mots = [torch.zeros((numSuperPixels,selPixIdxs.shape[0]),dtype=torch.float32) for _ in range(len(H_mots))]
-        for i in tqdm(range(len(H_mots)),desc='Computing HD matrices for all motion indices'):
+        # Pre-compute z-specific column masks/remaps once (independent of motion index).
+        sel_pix_z = selPixIdxs // plane_size
+        z_masks_torch = [torch.from_numpy(sel_pix_z == z) for z in range(numFastZs)]
+        z_col_idxs_torch = [torch.nonzero(z_mask, as_tuple=False).squeeze(1) for z_mask in z_masks_torch]
+        z_remaps_torch = []
+        for z in range(numFastZs):
+            remap = torch.full((selPixIdxs.shape[0],), -1, dtype=torch.long)
+            if z_col_idxs_torch[z].numel() > 0:
+                remap[z_col_idxs_torch[z]] = torch.arange(z_col_idxs_torch[z].numel(), dtype=torch.long)
+            z_remaps_torch.append(remap)
+
+        # Compute rho on-the-fly per motion to avoid storing all HD_mots in memory.
+        rho = np.full((len(selPixIdxs),lowResDataNorm.shape[1]), np.nan, dtype=np.float32)
+        z_col_idxs_np = [z_idx.numpy() for z_idx in z_col_idxs_torch]
+        for i in tqdm(range(len(uniqueMotionToKeepYX)), desc='Computing rho for all motion indices'):
+            motion_frames = np.flatnonzero(motIndsYX == i)
+            if motion_frames.size == 0:
+                continue
+
+            H_mot = H_mots[i].coalesce()
+            H_idxs = H_mot.indices()
+            H_vals = H_mot.values()
+            nrows, _ = H_mot.size()
+            residual_motion = residual[:, motion_frames].T
+
+            validPixMask = np.zeros((numFastZs, dmdPixelsPerColumn, dmdPixelsPerRow), dtype=bool)
+            validPixMask[refD, refR + int(uniqueMotionToKeepYX[i, 0]), refC + int(uniqueMotionToKeepYX[i, 1])] = True
+            validPixMask = ndimage.binary_dilation(validPixMask, structure=np.ones((1, psf[f'DMD{DMDix+1}'].shape[0], psf[f'DMD{DMDix+1}'].shape[1]), dtype=bool))
+            validPixMask = ndimage.binary_erosion(validPixMask, structure=np.ones((1, psf[f'DMD{DMDix+1}'].shape[0], psf[f'DMD{DMDix+1}'].shape[1] * 2 - 1), dtype=bool))
+            validPixIdxs = np.flatnonzero(validPixMask)
+            valid_lookup = np.zeros(numFastZs * plane_size, dtype=bool)
+            valid_lookup[validPixIdxs] = True
+            valid_sel_cols = valid_lookup[selPixIdxs]
+
             for z in range(numFastZs):
-                zMask = selPixIdxs // (dmdPixelsPerColumn * dmdPixelsPerRow) == z
-                H_mot = H_mots[i].coalesce()
-                H_idxs = H_mot.indices()
-                H_vals = H_mot.values()
-                nrows, ncols = H_mot.size()
+                new_ncols = int(z_col_idxs_torch[z].numel())
+                if new_ncols == 0:
+                    continue
+
+                zMask = z_masks_torch[z]
                 keep_mask = zMask[H_idxs[1]]
-                new_ncols = int(zMask.sum().item())
+                if keep_mask.sum().item() == 0:
+                    continue
 
-                remap = torch.full((ncols,),-1, dtype=torch.long, device=H_idxs.device)
-                remap[zMask] = torch.arange(new_ncols,device=H_idxs.device)
-
+                remap = z_remaps_torch[z]
                 new_rows = H_idxs[0, keep_mask]
                 new_cols = remap[H_idxs[1, keep_mask]]
                 new_idxs = torch.stack([new_rows, new_cols], dim=0)
                 new_vals = H_vals[keep_mask]
-
                 H_sub = torch.sparse_coo_tensor(new_idxs, new_vals, (nrows, new_ncols), dtype=torch.float32).coalesce()
 
                 HD = torch.sparse.mm(H_sub, D[z])
-                HD = HD / torch.sum(HD,dim=0,keepdim=True)
-
+                HD = HD / torch.sum(HD, dim=0, keepdim=True)
                 HD_expanded = torch.sparse.mm(H_sub, D_expanded[z])
-                HD_expanded = HD_expanded / torch.sum(HD_expanded,dim=0,keepdim=True)
+                HD_expanded = HD_expanded / torch.sum(HD_expanded, dim=0, keepdim=True)
+                HD_diff = HD - HD_expanded
 
-                HD_mots[i][:,zMask] = HD - HD_expanded
+                z_cols = z_col_idxs_np[z]
+                z_valid_mask = valid_sel_cols[z_cols]
+                if not np.any(z_valid_mask):
+                    continue
+                z_valid_cols = z_cols[z_valid_mask]
+                local_valid_cols = remap[torch.from_numpy(z_valid_cols)].long()
 
-            validPixMask = np.zeros((numFastZs,dmdPixelsPerColumn,dmdPixelsPerRow), dtype=bool)
-            validPixMask[refD,refR + int(uniqueMotion[motIndsToKeep[i],0]),refC + int(uniqueMotion[motIndsToKeep[i],1])] = True
-            validPixMask = ndimage.binary_dilation(validPixMask, structure=np.ones((1,psf[f'DMD{DMDix+1}'].shape[0],psf[f'DMD{DMDix+1}'].shape[1]), dtype=bool))
-            validPixMask = ndimage.binary_erosion(validPixMask, structure=np.ones((1,psf[f'DMD{DMDix+1}'].shape[0],psf[f'DMD{DMDix+1}'].shape[1]*2-1), dtype=bool))
-            validPixIdxs = np.flatnonzero(validPixMask)
+                rho[np.ix_(z_valid_cols,motion_frames)] = (residual_motion @ HD_diff[:, local_valid_cols].numpy()).T
 
-            HD_mots[i][:,~np.isin(selPixIdxs,validPixIdxs)] = 0
         
-            
-        rho = np.zeros((lowResDataNorm.shape[1],len(selPixIdxs)), dtype=np.float32)
-        rho[:] = np.nan
-        for i, motion_idx in tqdm(enumerate(motIndsToKeep),desc='Computing rho for all motion indices'):
-            motion_frames = (motInds == motion_idx).nonzero()[0]
-            # Use pre-computed HD matrix
-            rho[motion_frames,:] = residualFilt[:,motion_frames].T @ HD_mots[i].numpy()
-        
-        del HD_mots
+        nanCt = np.mean(np.isnan(rho),axis=1)
+        rho[nanCt > 0.5] = np.nan
 
-        rho[rho == 0] = np.nan
+        decayTau_frames = params['decayTau_s'] * params['alignHz'][f'DMD{DMDix+1}']
+        k1d = np.exp(
+            np.linspace(-np.ceil(decayTau_frames * 3), 0, int(np.ceil(decayTau_frames * 3) + 1))
+            / decayTau_frames
+        )
+        k1d = k1d / np.sum(k1d)
+        k2d = np.expand_dims(k1d, 0)
+        # NaN-aware smoothing along time only (1xL kernel). Process row chunks so
+        # np.nan_to_num / isfinite never build full-array boolean temps (OOM risk).
+        n_time = rho.shape[1]
+        bytes_per_row = max(1, n_time) * np.dtype(np.float32).itemsize * 3
+        row_chunk = max(64, min(4096, int(200_000_000 // bytes_per_row)))
+        # --- Temporarily disabled: robust rolling-MAD normalization (divide by MAD, scale to Gaussian std) ---
+        # mad_eps = np.float32(1e-12)
+        # mad_gauss_scale = np.float32(0.6741891400433162)
+        # mad_win = max(len(k1d), 3)
+        # pad_mad = mad_win // 2
+        # mad_bytes_per_row = (n_time + 2 * pad_mad) * np.dtype(np.float32).itemsize
+        # Sub-batch rolling MAD so padded (b,T) stays in cache / avoids huge temporaries.
+        # mad_subbatch = max(8, min(row_chunk, int(100_000_000 // max(mad_bytes_per_row * 3, 1))))
+        for r0 in tqdm(range(0, rho.shape[0], row_chunk), desc='Smoothing rho'):
+            r1 = min(r0 + row_chunk, rho.shape[0])
+            rc = rho[r0:r1].copy()
+            row_has_data = np.any(np.isfinite(rc), axis=1)
+            if not np.any(row_has_data):
+                rho[r0:r1] = rc
+                continue
+
+            rc_valid = rc[row_has_data]
+            rho_num = np.nan_to_num(rc_valid, nan=0.0)
+            rho_den = signal.convolve(
+                np.isfinite(rc_valid).astype(np.float32), k2d, mode='same'
+            )
+            rho_num = signal.convolve(rho_num, k2d, mode='same')
+            valid_den = rho_den > 0.75
+            np.divide(rho_num, rho_den, out=rho_num, where=valid_den)
+            rho_num[~valid_den] = np.nan
+            # Rolling MAD in row sub-batches: vectorized nanmedian over (b,T,win).
+            # for j0 in range(0, rho_num.shape[0], mad_subbatch):
+            #     j1 = min(j0 + mad_subbatch, rho_num.shape[0])
+            #     sub = rho_num[j0:j1]
+            #     if not np.any(np.isfinite(sub)):
+            #         continue
+            #     mad_b = _rolling_mad_rows_same(sub, mad_win)
+            #     valid_scale = np.isfinite(mad_b) & (mad_b > mad_eps)
+            #     np.divide(sub, mad_b, out=sub, where=valid_scale)
+            #     np.multiply(sub, mad_gauss_scale, out=sub, where=valid_scale)
+            #     sub[~valid_scale] = np.nan
+            rc[row_has_data] = rho_num
+            rho[r0:r1] = rc
 
         # Process frames more efficiently by avoiding unnecessary allocations
-        n_frames = rho.shape[0]
+        n_frames = rho.shape[1]
         batch_size = min(1000, n_frames)  # Smaller batch size to reduce memory
         num_batches = int(np.ceil(n_frames / batch_size))
         
         # Pre-compute 2D coordinates once
         spatial_coords = np.unravel_index(selPixIdxs, (numFastZs,dmdPixelsPerColumn, dmdPixelsPerRow))
-        depth_indices = spatial_coords[0][None, :]
-        row_indices = spatial_coords[1][None, :]  # Shape: (1, len(selPixIdxs))
-        col_indices = spatial_coords[2][None, :]  # Shape: (1, len(selPixIdxs))
+        depth_indices = spatial_coords[0][None, :].astype(np.intp, copy=False)
+        row_indices = spatial_coords[1][None, :].astype(np.intp, copy=False)  # Shape: (1, len(selPixIdxs))
+        col_indices = spatial_coords[2][None, :].astype(np.intp, copy=False)  # Shape: (1, len(selPixIdxs))
         
         # Pre-compute dilation structure
         dilation_struct = np.ones((3,3), dtype=np.uint8)
@@ -1322,12 +1591,42 @@ def main():
         act_im = np.zeros((numFastZs,dmdPixelsPerColumn, dmdPixelsPerRow), dtype=np.float32)
         temporal_pad = 1
 
+        # Crop computation to a padded ROI that contains all selected pixels.
+        # This skips large all-NaN spatial regions that can never be populated.
+        row_min = int(np.min(row_indices))
+        row_max = int(np.max(row_indices))
+        col_min = int(np.min(col_indices))
+        col_max = int(np.max(col_indices))
+        row_start = max(0, row_min - 1)
+        row_stop = min(dmdPixelsPerColumn, row_max + 2)  # exclusive
+        col_start = max(0, col_min - 1)
+        col_stop = min(dmdPixelsPerRow, col_max + 2)  # exclusive
+        roi_h = row_stop - row_start
+        roi_w = col_stop - col_start
+
+        row_indices_roi = (row_indices - row_start).astype(np.intp, copy=False)
+        col_indices_roi = (col_indices - col_start).astype(np.intp, copy=False)
+
         # Preallocate reusable buffers for the largest needed batch (including temporal padding)
         prealloc_size = int(min(batch_size + 2*temporal_pad, n_frames))
-        batch_rho = np.empty((prealloc_size, numFastZs, dmdPixelsPerColumn, dmdPixelsPerRow), dtype=np.float32)
-        local_maxima = np.empty_like(batch_rho, dtype=bool)
+        batch_rho = np.empty((prealloc_size, numFastZs, roi_h, roi_w), dtype=np.float32)
         nan_mask = np.empty_like(batch_rho, dtype=bool)
+        interior_shape = (
+            max(prealloc_size - 2, 0),
+            numFastZs,
+            max(roi_h - 2, 0),
+            max(roi_w - 2, 0),
+        )
+        local_maxima_core = np.empty(interior_shape, dtype=bool)
+        compare_tmp_core = np.empty(interior_shape, dtype=bool)
+        batch_rho_pow2_core = np.empty(interior_shape, dtype=np.float32)
         time_indices_pre = np.arange(prealloc_size)[:, None]
+        profile_activity_map = bool(params.get("profile_activity_map", False))
+        if profile_activity_map:
+            t_fill_scatter = 0.0
+            t_dilate = 0.0
+            t_localmax = 0.0
+            t_accumulate = 0.0
 
         for batch_idx in tqdm(range(num_batches), desc="Creating activity map"):
             # Calculate batch bounds
@@ -1339,40 +1638,86 @@ def main():
             
             # Views into preallocated buffers for the current batch
             br = batch_rho[:curr_size]
-            lm = local_maxima[:curr_size]
             nm = nan_mask[:curr_size]
 
-            # Reset buffers
-            br.fill(np.nan)
-
-            # Fill batch data and record which voxels were written
+            # Fill batch data and record which voxels were written.
+            # rho is (pixels, time), so batch over axis 1 and transpose to (time, pixels).
+            # Initializing nm=True marks unwritten voxels as invalid without scanning full br.
+            if profile_activity_map:
+                t0 = time.perf_counter()
+            br.fill(0)
+            nm.fill(True)
             time_indices = time_indices_pre[:curr_size]
-            br[time_indices, depth_indices, row_indices, col_indices] = rho[padded_start:padded_end, :]
+            batch_vals = rho[:, padded_start:padded_end].T
+            br[time_indices, depth_indices, row_indices_roi, col_indices_roi] = batch_vals
+            nm[time_indices, depth_indices, row_indices_roi, col_indices_roi] = np.isnan(batch_vals)
+            if profile_activity_map:
+                t_fill_scatter += time.perf_counter() - t0
 
             # Handle NaN values
-            np.isnan(br, out=nm)
+            if profile_activity_map:
+                t0 = time.perf_counter()
             br[nm] = 0
+            core_t = curr_size - 2
+            if core_t <= 0:
+                continue
+
             dilated_nan_mask = fast_dilation(nm, dilation_struct)
+            if profile_activity_map:
+                t_dilate += time.perf_counter() - t0
 
-            # Calculate local maxima directly without intermediate mask array
-            lm.fill(False)
-            lm[1:-1,:,1:-1,1:-1] = (br[1:-1,:,1:-1,1:-1] > br[:-2,:,1:-1,1:-1]) & \
-                                   (br[1:-1,:,1:-1,1:-1] > br[2:,:,1:-1,1:-1]) & \
-                                   (br[1:-1,:,1:-1,1:-1] > br[1:-1,:,:-2,1:-1]) & \
-                                   (br[1:-1,:,1:-1,1:-1] > br[1:-1,:,2:,1:-1]) & \
-                                   (br[1:-1,:,1:-1,1:-1] > br[1:-1,:,1:-1,:-2]) & \
-                                   (br[1:-1,:,1:-1,1:-1] > br[1:-1,:,1:-1,2:])
-            
-            # Combine conditions and compute activity in one step
-            lm &= ~dilated_nan_mask
-            act_im += np.sum(lm * (br**3), axis=0, dtype=np.float32)
+            if profile_activity_map:
+                t0 = time.perf_counter()
+            center = br[1:-1, :, 1:-1, 1:-1]
+            lmc = local_maxima_core[:core_t]
+            ctmp = compare_tmp_core[:core_t]
+            b3c = batch_rho_pow2_core[:core_t]
 
-        del rho, lm, br, batch_rho
+            np.greater(center, br[:-2, :, 1:-1, 1:-1], out=lmc)
+            np.greater(center, br[2:, :, 1:-1, 1:-1], out=ctmp)
+            np.logical_and(lmc, ctmp, out=lmc)
+            np.greater(center, br[1:-1, :, :-2, 1:-1], out=ctmp)
+            np.logical_and(lmc, ctmp, out=lmc)
+            np.greater(center, br[1:-1, :, 2:, 1:-1], out=ctmp)
+            np.logical_and(lmc, ctmp, out=lmc)
+            np.greater(center, br[1:-1, :, 1:-1, :-2], out=ctmp)
+            np.logical_and(lmc, ctmp, out=lmc)
+            np.greater(center, br[1:-1, :, 1:-1, 2:], out=ctmp)
+            np.logical_and(lmc, ctmp, out=lmc)
+            np.logical_not(dilated_nan_mask[1:-1, :, 1:-1, 1:-1], out=ctmp)
+            np.logical_and(lmc, ctmp, out=lmc)
+            if profile_activity_map:
+                t_localmax += time.perf_counter() - t0
 
-        nan_mask = (act_im == 0) | (np.isnan(act_im))
+            if profile_activity_map:
+                t0 = time.perf_counter()
+            np.multiply(center, center, out=b3c)
+            np.multiply(b3c, lmc, out=b3c, casting='unsafe')
+            act_im[:, row_start + 1:row_stop - 1, col_start + 1:col_stop - 1] += np.sum(b3c, axis=0, dtype=np.float32)
+            if profile_activity_map:
+                t_accumulate += time.perf_counter() - t0
+
+        # del rho, br, batch_rho
+        if profile_activity_map:
+            total_profiled = t_fill_scatter + t_dilate + t_localmax + t_accumulate
+            if total_profiled > 0:
+                print(
+                    "[profile_activity_map] "
+                    f"fill_scatter={t_fill_scatter:.3f}s ({100*t_fill_scatter/total_profiled:.1f}%), "
+                    f"dilate={t_dilate:.3f}s ({100*t_dilate/total_profiled:.1f}%), "
+                    f"localmax={t_localmax:.3f}s ({100*t_localmax/total_profiled:.1f}%), "
+                    f"accumulate={t_accumulate:.3f}s ({100*t_accumulate/total_profiled:.1f}%)"
+                )
+
+        ##
+        nan_mask = np.full_like(act_im, True, dtype=bool)
+        validSelPix = np.flatnonzero(nanCt <= 0.5)
+        nan_mask[np.unravel_index(selPixIdxs[validSelPix], nan_mask.shape)] = False
+ 
+        # nan_mask = (act_im == 0) | (np.isnan(act_im))
         act_im[nan_mask] = np.nan
 
-        med_act_im = ndimage.generic_filter(act_im, np.nanmedian, size=(1,15,15))
+        med_act_im = ndimage.generic_filter(act_im, np.nanmedian, size=(1,11,11))
         act_im = act_im - med_act_im
         act_im[nan_mask] = np.nan
         
