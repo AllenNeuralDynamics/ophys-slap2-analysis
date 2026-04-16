@@ -126,6 +126,7 @@ if sum(pTmp(:))
         newIdx = nBefore + 1;
 
         CC = bwconncomp(actSelPix);
+        foundCC = false;
         for i = 1:CC.NumObjects
             if ismember(idxNew, CC.PixelIdxList{i})
                 actSelPix = false(size(actSelPix));
@@ -138,8 +139,14 @@ if sum(pTmp(:))
                 peakIndices = sub2ind(size(actIM), iy, ix);
                 thetaIdxsToFit = actSelPix(peakIndices);
 
+                foundCC = true;
                 break;
             end
+        end
+        if ~foundCC
+            error('getActImPeaks:PeakNotInConnectedComponent', ...
+                'Peak linear index %d (row %d, col %d) is not in any connected component of actSelPix (%d objects).', ...
+                idxNew, pY, pX, CC.NumObjects);
         end
 
         ub = [Inf*ones(sum(thetaIdxsToFit),1),min(size(actIM,1)+0.5,pLocs(thetaIdxsToFit,1)+1.5),min(size(actIM,2)+0.5,pLocs(thetaIdxsToFit,2)+1.5),5*ones(sum(thetaIdxsToFit),1)];
