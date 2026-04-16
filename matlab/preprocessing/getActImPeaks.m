@@ -185,6 +185,8 @@ if sum(pTmp(:))
         if any(fitSupport(:)) && max(explored(:)) > peakth
             pTmp = explored == max(explored(:));
         end
+
+        actSelPix = imdilate(pTmp, ones(9)) & ~isnan(actIM);
     end
 
     switch peakFuncOpt
