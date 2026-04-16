@@ -186,7 +186,7 @@ if sum(pTmp(:))
             pTmp = explored == max(explored(:));
         end
 
-        actSelPix = imdilate(pTmp, ones(9)) & ~isnan(actIM);
+        actSelPix = imdilate(pIM, ones(9)) & ~isnan(actIM);
     end
 
     switch peakFuncOpt
