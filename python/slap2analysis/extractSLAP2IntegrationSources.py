@@ -877,12 +877,6 @@ def create_parameter_gui():
     # Create parameter inputs
     row = 0
     
-    # # Discard Initial (s)
-    # ttk.Label(main_frame, text="Discard Initial (s):").grid(row=row, column=0, sticky=tk.W, pady=2)
-    # param_vars['discardInitial_s'] = tk.DoubleVar(value=0.1)
-    # ttk.Entry(main_frame, textvariable=param_vars['discardInitial_s'], width=15).grid(row=row, column=1, pady=2)
-    # row += 1
-    
     # Analyze Hz
     ttk.Label(main_frame, text="Analyze Hz:").grid(row=row, column=0, sticky=tk.W, pady=2)
     param_vars['analyzeHz'] = tk.IntVar(value=100)
@@ -937,10 +931,16 @@ def create_parameter_gui():
     ttk.Entry(main_frame, textvariable=param_vars['max_workers'], width=15).grid(row=row, column=1, pady=2)
     row += 1
     
+    # Peak threshold (z-score units above local background)
+    ttk.Label(main_frame, text="Peak Threshold:").grid(row=row, column=0, sticky=tk.W, pady=2)
+    param_vars['peakth'] = tk.DoubleVar(value=3.0)
+    ttk.Entry(main_frame, textvariable=param_vars['peakth'], width=15).grid(row=row, column=1, pady=2)
+    row += 1
+
     # Select Soma
     ttk.Label(main_frame, text="Select Soma?").grid(row=row, column=0, sticky=tk.W, pady=2)
-    param_vars['select_soma'] = tk.IntVar(value=False)
-    ttk.Entry(main_frame, textvariable=param_vars['select_soma'], width=15).grid(row=row, column=1, pady=2)
+    param_vars['select_soma'] = tk.BooleanVar(value=False)
+    ttk.Checkbutton(main_frame, variable=param_vars['select_soma']).grid(row=row, column=1, sticky=tk.W, pady=2)
     row += 1
 
     # Add some spacing
@@ -952,7 +952,6 @@ def create_parameter_gui():
     def on_ok():
         try:
             result['params'] = {
-                # 'discardInitial_s': param_vars['discardInitial_s'].get(),
                 'analyzeHz': param_vars['analyzeHz'].get(),
                 'activityChannel': param_vars['activityChannel'].get(),
                 'decayTau_s': param_vars['decayTau_s'].get(),
@@ -960,9 +959,10 @@ def create_parameter_gui():
                 'dXY': param_vars['dXY'].get(),
                 'sparse_fac': float(np.exp(param_vars['sparse_fac_log'].get())),
                 'denoiseWindow_s': param_vars['denoiseWindow_s'].get(),
+                'peakth': param_vars['peakth'].get(),
                 'operator': param_vars['operator'].get(),
                 'max_workers': param_vars['max_workers'].get(),
-                'select_soma': param_vars['select_soma'].get()
+                'select_soma': bool(param_vars['select_soma'].get())
             }
             result['cancelled'] = False
             root.destroy()
