@@ -16,20 +16,13 @@ import importlib
 import skimage.io as skimio
 import h5py
 from scipy import stats, signal
+from scipy.special import erf as _erf
 import slap2_utils
 import pandas as pd
 import subprocess
 from tqdm import tqdm
 import re
-import warnings
 from scipy.sparse.linalg import svds
-
-try:
-    from numba import njit, prange
-
-    _NUMBA_AVAILABLE = True
-except ImportError:
-    _NUMBA_AVAILABLE = False
 
 sys.path.append('C:/Users/michael.xie/Documents/ophys-slap2-analysis/python')
 # sys.path.append(str(Path(__file__).parent.parent))
@@ -98,78 +91,6 @@ def fast_dilation(mask, kernel, iterations=1):
         ).astype(bool, copy=False)
 
     return out
-
-
-if _NUMBA_AVAILABLE:
-    @njit(cache=True)
-    def _median_abs_dev_window_inplace_f32(wv, buf, win):
-        """MAD for one window: median(|x - median(x)|), NaNs omitted."""
-        n = 0
-        for k in range(win):
-            v = wv[k]
-            if not np.isnan(v):
-                buf[n] = float(v)
-                n += 1
-        if n == 0:
-            return np.nan
-        med = np.median(buf[:n])
-        for k in range(n):
-            buf[k] = abs(buf[k] - med)
-        return np.median(buf[:n])
-
-    @njit(parallel=True, cache=True)
-    def _rolling_mad_from_xp_numba(xp, win, out):
-        """Reflect-padded rows ``xp`` shape (b, T+2*pad); ``out`` shape (b, T)."""
-        b = xp.shape[0]
-        T = out.shape[1]
-        for i in prange(b):
-            buf = np.empty(win, dtype=np.float64)
-            for t in range(T):
-                out[i, t] = _median_abs_dev_window_inplace_f32(xp[i, t : t + win], buf, win)
-
-def _rolling_mad_rows_same(rows_bt, win):
-    """Rolling MAD along time (axis=1) for a batch of rows.
-
-    For each (row, time) position, MAD = median(|v - median(v)|) over a length-``win``
-    window. NaNs are ignored via ``nanmedian``. Edges use reflect padding.  ``rows_bt``
-    must be float32, shape ``(b, T)``; returns float32 ``(b, T)``.
-
-    Batching keeps one strided window view shared across rows so ``nanmedian`` runs in
-    large chunks (much faster than one row at a time).
-    """
-    rows_bt = np.asarray(rows_bt, dtype=np.float32, order="C")
-    if rows_bt.ndim != 2:
-        raise ValueError("rows_bt must be 2-D (b, T)")
-    b, T = int(rows_bt.shape[0]), int(rows_bt.shape[1])
-    if b == 0:
-        return np.empty((0, T), dtype=np.float32)
-    if T == 0:
-        return np.empty((b, 0), dtype=np.float32)
-    win = int(win)
-    win = max(1, min(win, T))
-    pad = win // 2
-    # Skip all-NaN rows entirely; avoids expensive nanmedian work and warnings.
-    row_has_data = np.any(np.isfinite(rows_bt), axis=1)
-    out = np.full((b, T), np.nan, dtype=np.float32)
-    if not np.any(row_has_data):
-        return out
-
-    rows_valid = rows_bt[row_has_data]
-    xp = np.pad(rows_valid, ((0, 0), (pad, pad)), mode="reflect")
-    if _NUMBA_AVAILABLE:
-        mad_valid = np.empty((rows_valid.shape[0], T), dtype=np.float32)
-        _rolling_mad_from_xp_numba(xp, win, mad_valid)
-        out[row_has_data] = mad_valid
-        return out
-
-    w = np.lib.stride_tricks.sliding_window_view(xp, win, axis=1)
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", category=RuntimeWarning)
-        med = np.nanmedian(w, axis=2)
-        mad = np.nanmedian(np.abs(w - med[:, :, np.newaxis]), axis=2)
-    out[row_has_data] = mad.astype(np.float32, copy=False)
-    return out
-
 
 def ref_pixs_to_drc(refPixs, dmdPixelsPerColumn, dmdPixelsPerRow):
     """Map flat reference pixel indices to DMD (depth D, column C, row R) integer indices."""
@@ -270,6 +191,398 @@ def compute_f0(Fin, denoise_window: int, hull_window: int):
         F0[:,cix] = pchip(np.arange(T))
 
     return F0.reshape(orig_shape)
+
+def _gaussian_peaks_integrated(theta, yxdata):
+    """Integrated isotropic 2D Gaussians over unit pixels on a regular grid.
+
+    Port of gaussianPeaksIntegrated from getActImPeaks.m.
+    theta:  (N, 4) array with columns [amp, mu_y, mu_x, sigma]
+    yxdata: (M, 2) array with columns [y, x] — pixel centre coordinates
+    Returns: (M,) array of predicted values.
+    """
+    x_int = yxdata[:, 1].astype(np.intp)
+    y_int = yxdata[:, 0].astype(np.intp)
+    x_min = int(x_int.min()); x_max = int(x_int.max())
+    y_min = int(y_int.min()); y_max = int(y_int.max())
+    x_idx = x_int - x_min
+    y_idx = y_int - y_min
+
+    A  = theta[:, 0]                                     # (N,)
+    my = theta[:, 1]                                     # (N,)
+    mx = theta[:, 2]                                     # (N,)
+    s  = np.maximum(theta[:, 3], np.finfo(float).eps)    # (N,)
+
+    c   = np.sqrt(np.pi / 2)
+    rt2 = np.sqrt(2.0)
+
+    xc = np.arange(x_min, x_max + 1, dtype=float)
+    xL = (xc - 0.5)[:, np.newaxis]                      # (Wg, 1)
+    xR = (xc + 0.5)[:, np.newaxis]                      # (Wg, 1)
+    Ix = c * s[np.newaxis, :] * (
+        _erf((xR - mx[np.newaxis, :]) / (rt2 * s[np.newaxis, :])) -
+        _erf((xL - mx[np.newaxis, :]) / (rt2 * s[np.newaxis, :]))
+    )  # (Wg, N)
+
+    yc = np.arange(y_min, y_max + 1, dtype=float)
+    yB = (yc - 0.5)[:, np.newaxis]                      # (Hg, 1)
+    yT = (yc + 0.5)[:, np.newaxis]                      # (Hg, 1)
+    Iy = c * s[np.newaxis, :] * (
+        _erf((yT - my[np.newaxis, :]) / (rt2 * s[np.newaxis, :])) -
+        _erf((yB - my[np.newaxis, :]) / (rt2 * s[np.newaxis, :]))
+    )  # (Hg, N)
+
+    img = (Iy * A[np.newaxis, :]) @ Ix.T   # (Hg, Wg)
+    return img[y_idx, x_idx]
+
+
+def _gaussian_peaks_integrated_val_jac(theta, yxdata):
+    """Integrated Gaussians with analytical Jacobian (shared intermediates).
+
+    theta:  (N, 4) [amp, mu_y, mu_x, sigma]
+    yxdata: (M, 2) [y, x]
+    Returns: (val, J) where val is (M,) and J is (M, 4*N).
+    """
+    x_int = yxdata[:, 1].astype(np.intp)
+    y_int = yxdata[:, 0].astype(np.intp)
+    M = len(x_int)
+    N = theta.shape[0]
+
+    x_min = int(x_int.min()); x_max = int(x_int.max())
+    y_min = int(y_int.min()); y_max = int(y_int.max())
+    x_idx = x_int - x_min
+    y_idx = y_int - y_min
+
+    A  = theta[:, 0]
+    my = theta[:, 1]
+    mx = theta[:, 2]
+    s  = np.maximum(theta[:, 3], np.finfo(float).eps)
+
+    c   = np.sqrt(np.pi / 2)
+    rt2 = np.sqrt(2.0)
+    inv_rt2s = 1.0 / (rt2 * s[np.newaxis, :])        # (1, N)
+
+    xc = np.arange(x_min, x_max + 1, dtype=float)
+    xL = (xc - 0.5)[:, np.newaxis]                   # (Wg, 1)
+    xR = (xc + 0.5)[:, np.newaxis]                   # (Wg, 1)
+    ux_L = (xL - mx[np.newaxis, :]) * inv_rt2s        # (Wg, N)
+    ux_R = (xR - mx[np.newaxis, :]) * inv_rt2s        # (Wg, N)
+    erf_ux_L = _erf(ux_L)
+    erf_ux_R = _erf(ux_R)
+    Ix = c * s[np.newaxis, :] * (erf_ux_R - erf_ux_L)  # (Wg, N)
+
+    yc = np.arange(y_min, y_max + 1, dtype=float)
+    yB = (yc - 0.5)[:, np.newaxis]                   # (Hg, 1)
+    yT = (yc + 0.5)[:, np.newaxis]                   # (Hg, 1)
+    uy_B = (yB - my[np.newaxis, :]) * inv_rt2s        # (Hg, N)
+    uy_T = (yT - my[np.newaxis, :]) * inv_rt2s        # (Hg, N)
+    erf_uy_B = _erf(uy_B)
+    erf_uy_T = _erf(uy_T)
+    Iy = c * s[np.newaxis, :] * (erf_uy_T - erf_uy_B)  # (Hg, N)
+
+    # --- forward value ---
+    img = (Iy * A[np.newaxis, :]) @ Ix.T              # (Hg, Wg)
+    val = img[y_idx, x_idx]                            # (M,)
+
+    # --- Jacobian (M, 4*N) ---
+    Iy_m = Iy[y_idx, :]                               # (M, N)
+    Ix_m = Ix[x_idx, :]                               # (M, N)
+
+    # d/dA_n
+    dval_dA = Iy_m * Ix_m                              # (M, N)
+
+    # d(Iy)/d(my):  exp(-uy_B^2) - exp(-uy_T^2)   (simplification where c*2/(rt2*sqrt(pi)) = 1)
+    exp_uyB2 = np.exp(-uy_B ** 2)                      # (Hg, N)
+    exp_uyT2 = np.exp(-uy_T ** 2)                      # (Hg, N)
+    dIy_dmy_m = (exp_uyB2 - exp_uyT2)[y_idx, :]       # (M, N)
+    dval_dmy = A[np.newaxis, :] * dIy_dmy_m * Ix_m    # (M, N)
+
+    # d(Ix)/d(mx):  exp(-ux_L^2) - exp(-ux_R^2)
+    exp_uxL2 = np.exp(-ux_L ** 2)                      # (Wg, N)
+    exp_uxR2 = np.exp(-ux_R ** 2)                      # (Wg, N)
+    dIx_dmx_m = (exp_uxL2 - exp_uxR2)[x_idx, :]       # (M, N)
+    dval_dmx = A[np.newaxis, :] * Iy_m * dIx_dmx_m    # (M, N)
+
+    # d(Iy)/d(s) = Iy/s + sqrt(2)*(uy_B*exp(-uy_B^2) - uy_T*exp(-uy_T^2))
+    # d(Ix)/d(s) = Ix/s + sqrt(2)*(ux_L*exp(-ux_L^2) - ux_R*exp(-ux_R^2))
+    sqrt2 = rt2
+    dIy_ds_m = (Iy / s[np.newaxis, :]
+                + sqrt2 * (uy_B * exp_uyB2 - uy_T * exp_uyT2))[y_idx, :]
+    dIx_ds_m = (Ix / s[np.newaxis, :]
+                + sqrt2 * (ux_L * exp_uxL2 - ux_R * exp_uxR2))[x_idx, :]
+    dval_ds = A[np.newaxis, :] * (dIy_ds_m * Ix_m + Iy_m * dIx_ds_m)
+
+    J = np.empty((M, 4 * N), dtype=float)
+    J[:, 0::4] = dval_dA
+    J[:, 1::4] = dval_dmy
+    J[:, 2::4] = dval_dmx
+    J[:, 3::4] = dval_ds
+
+    return val, J
+
+
+def _lsq_curvefit(theta0, xdata, ydata, lb_flat, ub_flat, max_nfev=5000):
+    """Bounded Levenberg-Marquardt solver for integrated-Gaussian curve fitting.
+
+    Reimplements the subset of MATLAB lsqcurvefit (trust-region-reflective
+    with default options) used by getActImPeaks.m, but with an analytical
+    Jacobian so that each iteration needs only one forward+Jacobian evaluation
+    instead of 4*N finite-difference evaluations.
+
+    theta0:   (N, 4) initial parameters [amp, mu_y, mu_x, sigma]
+    xdata:    (M, 2) pixel centre coordinates
+    ydata:    (M,)   observed values (actIM(selPix) - mu_bg)
+    lb_flat, ub_flat: (4*N,) bound vectors (row-major flattened)
+    max_nfev: cap on function+Jacobian evaluations
+
+    Returns: (N, 4) optimised parameters.
+    """
+    x = np.clip(theta0.ravel().copy(), lb_flat, ub_flat)
+
+    val, J = _gaussian_peaks_integrated_val_jac(x.reshape(-1, 4), xdata)
+    r = val - ydata
+    cost = np.dot(r, r)
+    nfev = 1
+
+    lam = 1e-2          # initial damping  (MATLAB InitDamping default)
+
+    for _ in range(400):                               # MATLAB MaxIter default
+        if nfev >= max_nfev:
+            break
+
+        JtJ = J.T @ J
+        Jtr = J.T @ r
+        diag_JtJ = np.maximum(np.diag(JtJ), 1e-8)
+
+        delta = np.linalg.solve(JtJ + lam * np.diag(diag_JtJ), -Jtr)
+        x_new = np.clip(x + delta, lb_flat, ub_flat)
+
+        val_new, J_new = _gaussian_peaks_integrated_val_jac(
+            x_new.reshape(-1, 4), xdata)
+        r_new = val_new - ydata
+        cost_new = np.dot(r_new, r_new)
+        nfev += 1
+
+        if cost_new < cost:
+            step_norm = np.max(np.abs(x_new - x))
+            rel_cost_drop = (cost - cost_new) / max(cost, 1.0)
+
+            x = x_new
+            r = r_new
+            J = J_new
+            cost = cost_new
+            lam = max(lam * 0.1, 1e-10)
+
+            if step_norm < 1e-6 or rel_cost_drop < 1e-6:
+                break
+        else:
+            lam = min(lam * 10.0, 1e10)
+
+    return x.reshape(-1, 4)
+
+
+def _detect_peaks_2d(act_im_2d, exclusion_mask, mu_bg, sigma_bg, peak_thresh, peak_th):
+    """Per-plane peak detection with externally supplied background stats.
+
+    Returns (N, 4) array [amplitude, mu_y, mu_x, sigma], or (0, 4) if none.
+    """
+    H, W = act_im_2d.shape
+    empty = np.zeros((0, 4))
+    AMP_SCALE = 1.0 / 0.75
+
+    def _make_bounds(plocs):
+        n = plocs.shape[0]
+        lb = np.column_stack([np.zeros(n),
+                              np.maximum(0, plocs[:, 0] - 1.5),
+                              np.maximum(0, plocs[:, 1] - 1.5),
+                              np.ones(n) * 0.35])
+        ub = np.column_stack([np.full(n, np.inf),
+                              np.minimum(H - 1, plocs[:, 0] + 1.5),
+                              np.minimum(W - 1, plocs[:, 1] + 1.5),
+                              np.full(n, 5.0)])
+        return lb.ravel(), ub.ravel()
+
+    def _peak_mask(tf):
+        pIM = np.zeros((H, W), dtype=bool)
+        if tf.shape[0] > 0:
+            iy = np.clip(np.round(tf[:, 1]).astype(int), 0, H - 1)
+            ix = np.clip(np.round(tf[:, 2]).astype(int), 0, W - 1)
+            pIM[iy, ix] = True
+        return pIM
+
+    # --- Initial peak detection ---
+    explored = act_im_2d.copy()
+    explored[exclusion_mask | np.isnan(explored)] = -np.inf
+
+    rank8 = ndimage.rank_filter(explored, rank=7, size=3)
+    rank9 = ndimage.maximum_filter(explored, size=3)
+    pTmp = (rank8 > peak_thresh) & (explored == rank9)
+
+    if not np.any(pTmp):
+        return empty
+
+    pY, pX = np.where(pTmp)
+    amp = act_im_2d[pY, pX] * AMP_SCALE
+    n_peaks = len(pY)
+
+    act_sel_pix = ndimage.binary_dilation(pTmp, structure=np.ones((9, 9)))
+    act_sel_pix &= ~np.isnan(act_im_2d)
+
+    thetaf = np.column_stack([amp, pY.astype(float), pX.astype(float),
+                              0.5 * np.ones(n_peaks)])
+    p_locs = np.column_stack([pY.astype(float), pX.astype(float)])
+
+    # --- Initial least-squares fit ---
+    sel_yx = np.column_stack(np.where(act_sel_pix)).astype(float)
+    sel_vals = act_im_2d[act_sel_pix] - mu_bg
+
+    lb_f, ub_f = _make_bounds(p_locs)
+    thetaf = _lsq_curvefit(thetaf, sel_yx, sel_vals, lb_f, ub_f, max_nfev=5000)
+
+    # --- Build fit image & residual ---
+    buffer_mask = _peak_mask(thetaf)
+
+    fit_im = np.zeros((H, W), dtype=float)
+    fit_im[act_sel_pix] = _gaussian_peaks_integrated(thetaf, sel_yx)
+    res_im = (act_im_2d - fit_im - mu_bg) / sigma_bg
+
+    # --- Iterative residual peak finding (one new peak per CC per round) ---
+    fit_support = fit_im > 1e-3
+    reject_mask = np.zeros((H, W), dtype=bool)
+
+    labeled_full, _ = ndimage.label(act_sel_pix)
+
+    while True:
+        # Build explored residual image
+        e = res_im.copy()
+        e[buffer_mask | exclusion_mask | reject_mask | ~fit_support] = -np.inf
+        e[np.isnan(e)] = -np.inf
+
+        # Find the best peak candidate in each CC simultaneously
+        n_labels = int(labeled_full.max())
+        if n_labels == 0:
+            break
+
+        label_ids = list(range(1, n_labels + 1))
+        max_vals = ndimage.maximum(e, labeled_full, label_ids)
+        max_pos = ndimage.maximum_position(e, labeled_full, label_ids)
+
+        new_peaks = [(max_pos[i], label_ids[i])
+                     for i in range(n_labels) if max_vals[i] > peak_th]
+        if not new_peaks:
+            break
+
+        # Process each CC's new peak
+        modified_ccs = []
+        for (pY_new, pX_new), cc_label in new_peaks:
+            print(f"peak of amp {act_im_2d[pY_new, pX_new]}")
+            amp_new = act_im_2d[pY_new, pX_new] * AMP_SCALE
+
+            n_before = thetaf.shape[0]
+            thetaf = np.vstack([thetaf, [amp_new, float(pY_new), float(pX_new), 0.5]])
+            p_locs = np.vstack([p_locs, [float(pY_new), float(pX_new)]])
+            new_idx = n_before
+
+            cc_mask = labeled_full == cc_label
+            cc_yx = np.column_stack(np.where(cc_mask)).astype(float)
+            cc_vals = act_im_2d[cc_mask] - mu_bg
+
+            iy = np.clip(np.round(thetaf[:, 1]).astype(int), 0, H - 1)
+            ix = np.clip(np.round(thetaf[:, 2]).astype(int), 0, W - 1)
+            in_cc = cc_mask[iy, ix]
+
+            lb_cc, ub_cc = _make_bounds(p_locs[in_cc])
+            thetaf[in_cc] = _lsq_curvefit(thetaf[in_cc], cc_yx, cc_vals,
+                                          lb_cc, ub_cc, max_nfev=5000)
+
+            mu_y_new = thetaf[new_idx, 1]
+            mu_x_new = thetaf[new_idx, 2]
+            if abs(mu_y_new - round(mu_y_new)) < 1e-3 and abs(mu_x_new - round(mu_x_new)) < 1e-3:
+                refit_mask = in_cc.copy()
+                refit_mask[new_idx] = False
+                if np.any(refit_mask):
+                    lb_rf, ub_rf = _make_bounds(p_locs[refit_mask])
+                    thetaf[refit_mask] = _lsq_curvefit(thetaf[refit_mask], cc_yx, cc_vals,
+                                                       lb_rf, ub_rf, max_nfev=5000)
+                thetaf = np.delete(thetaf, new_idx, axis=0)
+                p_locs = np.delete(p_locs, new_idx, axis=0)
+                reject_mask[pY_new, pX_new] = True
+
+            modified_ccs.append((cc_mask, cc_yx))
+
+        # Global update once per round (not once per peak)
+        buffer_mask = _peak_mask(thetaf)
+        for cc_mask, cc_yx in modified_ccs:
+            fit_im[cc_mask] = _gaussian_peaks_integrated(thetaf, cc_yx)
+        res_im = (act_im_2d - fit_im - mu_bg) / sigma_bg
+        fit_support = fit_im > 1e-3
+
+        # Rebuild support from current peak positions
+        act_sel_pix = ndimage.binary_dilation(buffer_mask, structure=np.ones((9, 9)))
+        act_sel_pix &= ~np.isnan(act_im_2d)
+        labeled_full, _ = ndimage.label(act_sel_pix)
+
+    # --- Remove small peaks (peakFuncOpt=2 threshold) ---
+    if thetaf.shape[0] > 0:
+        s = thetaf[:, 3]
+        adj_thresh = peak_thresh / (np.pi / 2 * s**2 * _erf(1 / (np.sqrt(2) * s))**2)
+        thetaf = thetaf[thetaf[:, 0] >= adj_thresh]
+
+    return thetaf
+
+
+def get_act_im_peaks(act_im, peak_th=3.0, exclusion_mask=None):
+    """Find Gaussian peaks in a 3D (Z, H, W) activity image.
+
+    Background statistics and the detection threshold are computed once
+    across all planes so that sensitivity is uniform.  Each plane is then
+    processed independently with the shared threshold.
+
+    Parameters
+    ----------
+    act_im : (Z, H, W) array, may contain NaNs
+    peak_th : float, threshold in MAD-normalised standard deviations
+    exclusion_mask : None, or bool array broadcastable to (Z, H, W)
+
+    Returns
+    -------
+    source_seeds : (N, 3) array with columns [z, mu_y, mu_x],
+                   or (0, 3) if no peaks detected.
+    """
+    nZ, H, W = act_im.shape
+    empty = np.zeros((0, 3))
+
+    # Build per-plane exclusion masks
+    if exclusion_mask is None:
+        excl_planes = [np.zeros((H, W), dtype=bool)] * nZ
+    elif exclusion_mask.ndim == 2:
+        excl_planes = [exclusion_mask.astype(bool)] * nZ
+    else:
+        excl_planes = [exclusion_mask[z].astype(bool) for z in range(nZ)]
+
+    # Global background statistics across all planes
+    valid_vals = act_im[~np.isnan(act_im)]
+    if valid_vals.size == 0:
+        return empty
+
+    mu_bg = float(np.nanmedian(act_im))
+    sigma_bg = float(np.median(np.abs(valid_vals - np.median(valid_vals)))) / 0.6741891400433162
+    if sigma_bg <= 0:
+        return empty
+
+    peak_thresh = mu_bg + peak_th * sigma_bg
+
+    # Detect peaks plane-by-plane with the shared threshold
+    source_seeds_list = []
+    for z in range(nZ):
+        thetaf_z = _detect_peaks_2d(act_im[z], excl_planes[z],
+                                    mu_bg, sigma_bg, peak_thresh, peak_th)
+        if thetaf_z.shape[0] > 0:
+            z_col = np.full((thetaf_z.shape[0], 1), z, dtype=float)
+            source_seeds_list.append(
+                np.column_stack([z_col, thetaf_z[:, 1], thetaf_z[:, 2]]))
+
+    return np.vstack(source_seeds_list) if source_seeds_list else empty
+
 
 def get_trial_data(trial_info, DMDix, params, sampFreq, refStack, fastZ2RefZ, allSuperPixelIDs, dr, trialTable, all_channels=False):
     trialIx, keepTrial = trial_info
@@ -394,7 +707,7 @@ def get_trial_data(trial_info, DMDix, params, sampFreq, refStack, fastZ2RefZ, al
         return data/100, dataCt, aData, DSframes
 
 def get_high_res_traces(trial_info, DMDix, params, sampFreq, refStack, subsampleMatrixInds, fastZ2RefZ, sparseHInds, sparseHVals, 
-                allSuperPixelIDs, dr, trialTable, A_final, uniqueMotionDS, motIndsToKeepDS, psf, soma_sps):
+                allSuperPixelIDs, dr, trialTable, A_final, uniqueMotionDS, motIndsToKeepDS, median_z, psf, soma_sps):
     trialIx, keepTrial, backgroundDS = trial_info
     
     if not isinstance(A_final, torch.Tensor):
@@ -458,24 +771,29 @@ def get_high_res_traces(trial_info, DMDix, params, sampFreq, refStack, subsample
 
     uniqueMotion, motInds = np.unique(np.round(np.stack((motionR, motionC, motionZ), axis=1)), axis=0, return_inverse=True)
     
+    framesToKeep = np.isin(motInds, np.flatnonzero(np.abs(uniqueMotion[:, 2] - median_z) <= 1.5))
+
+    motInds = -1*np.ones((len(motInds),), dtype=np.int32)
+    uniqueMotion, motInds[framesToKeep] = np.unique(np.round(np.stack((motionR, motionC), axis=1)[framesToKeep,:]),axis=0,return_inverse=True)
+
     motIndsToKeep = np.zeros_like(motIndsToKeepDS, dtype=np.int64)
     motIndsToKeep[:] = -1
 
     for i, motion_idx_DS in enumerate(motIndsToKeepDS):
-        matches = np.all(uniqueMotion == uniqueMotionDS[motion_idx_DS,:],axis=1).nonzero()[0]
+        matches = np.flatnonzero(np.all(uniqueMotion[:,:2] == uniqueMotionDS[motion_idx_DS,:2],axis=1))
         if len(matches) > 0:
             motIndsToKeep[i] = matches[0]
     
     # background_spatial_components = background_spatial_components[:, motIndsToKeep != -1]
     motIndsToKeep = motIndsToKeep[motIndsToKeep != -1]
 
-    uniqueMotionYX = np.unique(uniqueMotion[motIndsToKeep,:2],axis=0)
+    framesToKeep = np.isin(motInds, motIndsToKeep)
 
     refD, refC, refR = ref_pixs_to_drc(subsampleMatrixInds[:, 0], dmdPixelsPerColumn, dmdPixelsPerRow)
 
     selPixMask = np.zeros((numFastZs,dmdPixelsPerColumn,dmdPixelsPerRow), dtype=bool)
-    for i in range(uniqueMotionYX.shape[0]):
-        selPixMask[refD,refR + int(uniqueMotionYX[i,0]),refC + int(uniqueMotionYX[i,1])] = True
+    for i in range(uniqueMotion.shape[0]):
+        selPixMask[refD,refR + int(uniqueMotion[i,0]),refC + int(uniqueMotion[i,1])] = True
     selPixMask = ndimage.binary_dilation(selPixMask, structure=np.ones((1,psf[f'DMD{DMDix+1}'].shape[0],psf[f'DMD{DMDix+1}'].shape[1]), dtype=bool))
     selPixIdxs = np.flatnonzero(selPixMask)
 
@@ -534,10 +852,13 @@ def get_high_res_traces(trial_info, DMDix, params, sampFreq, refStack, subsample
         # ).T
 
     globalF = np.sum(data, axis=0)
+    globalF[~framesToKeep] = np.nan
 
     F_soma = np.full((data.shape[1], len(soma_sps)), np.nan, dtype=np.float32)
     for i, roi_sps in enumerate(soma_sps):
         F_soma[:,i] = np.nansum(data2[roi_sps,:], axis=0)
+    
+    F_soma[~framesToKeep] = np.nan
 
     return phi.numpy(), F0.numpy(), frames, selPixIdxs, globalF, \
         (motionR, motionC, motionZ), (onlineYshifts, onlineXshifts, onlineZshifts), F_soma
@@ -1036,22 +1357,29 @@ def main():
 
         refD, refC, refR = ref_pixs_to_drc(subsampleMatrixInds[f'DMD{DMDix+1}'][:, 0], dmdPixelsPerColumn, dmdPixelsPerRow)
 
-        filterSize = psf[f'DMD{DMDix+1}'].shape[0]*psf[f'DMD{DMDix+1}'].shape[1]
-        
-        sparseHInds = np.zeros((2,numSuperPixels*filterSize), dtype=np.int32)
-        sparseHVals = np.zeros((numSuperPixels*filterSize,), dtype=np.float32)
+        psf_cur = psf[f'DMD{DMDix+1}'].astype(np.float32, copy=False)
+        psf_h, psf_w = psf_cur.shape
+        filterSize = psf_h * psf_w
+        plane_size = dmdPixelsPerColumn * dmdPixelsPerRow
+
+        row_offsets = (np.arange(psf_h, dtype=np.int32) - (psf_h // 2)).reshape(-1, 1)
+        col_offsets = (np.arange(psf_w, dtype=np.int32) - (psf_w // 2)).reshape(1, -1)
+        row_offsets_flat = np.broadcast_to(row_offsets, (psf_h, psf_w)).ravel()
+        col_offsets_flat = np.broadcast_to(col_offsets, (psf_h, psf_w)).ravel()
+        psf_vals_flat = psf_cur.ravel()
+
+        sparseHInds = np.zeros((2, numSuperPixels * filterSize), dtype=np.int32)
+        sparseHVals = np.zeros((numSuperPixels * filterSize,), dtype=np.float32)
+        sparseHInds[0] = np.repeat(subsampleMatrixInds[f'DMD{DMDix+1}'][:, 1] - 1, filterSize)
         for spIdx in range(subsampleMatrixInds[f'DMD{DMDix+1}'].shape[0]):
-            tmpMap = np.zeros((numFastZs,dmdPixelsPerColumn,dmdPixelsPerRow), dtype=np.float32)
-            tmpMap[:] = np.nan
-
-            tmpMap[refD[spIdx],
-                    int(refR[spIdx])-psf[f'DMD{DMDix+1}'].shape[0]//2:int(refR[spIdx])+psf[f'DMD{DMDix+1}'].shape[0]//2+1,
-                    int(refC[spIdx])-psf[f'DMD{DMDix+1}'].shape[1]//2:int(refC[spIdx])+psf[f'DMD{DMDix+1}'].shape[1]//2+1] = torch.from_numpy(psf[f'DMD{DMDix+1}'])
-
-            sparseHInds[0,spIdx*filterSize:(spIdx+1)*filterSize] = subsampleMatrixInds[f'DMD{DMDix+1}'][spIdx,1] - 1
-            sparseHInds[1,spIdx*filterSize:(spIdx+1)*filterSize] = np.where(~np.isnan(tmpMap.flatten()))[0]
-
-            sparseHVals[spIdx*filterSize:(spIdx+1)*filterSize] = tmpMap.flatten()[sparseHInds[1,spIdx*filterSize:(spIdx+1)*filterSize].astype(np.uint32)]
+            start = spIdx * filterSize
+            end = (spIdx + 1) * filterSize
+            rows = refR[spIdx] + row_offsets_flat
+            cols = refC[spIdx] + col_offsets_flat
+            sparseHInds[1, start:end] = (
+                refD[spIdx] * plane_size + rows * dmdPixelsPerRow + cols
+            ).astype(np.int32, copy=False)
+            sparseHVals[start:end] = psf_vals_flat
         non_zero_mask = sparseHVals != 0
         sparseHVals = sparseHVals[non_zero_mask]
         sparseHInds = sparseHInds[:, non_zero_mask]
@@ -1110,8 +1438,6 @@ def main():
             }
             np.savez(data_file, **data_arrays)
             print(f'Saved low resolution data to {data_file}')
-
-        return
 
         lowResDataNorm = lowResData / lowResDataCt
         lowResData2Norm = lowResData2 / lowResDataCt2
@@ -1559,17 +1885,6 @@ def main():
             valid_den = rho_den > 0.75
             np.divide(rho_num, rho_den, out=rho_num, where=valid_den)
             rho_num[~valid_den] = np.nan
-            # Rolling MAD in row sub-batches: vectorized nanmedian over (b,T,win).
-            # for j0 in range(0, rho_num.shape[0], mad_subbatch):
-            #     j1 = min(j0 + mad_subbatch, rho_num.shape[0])
-            #     sub = rho_num[j0:j1]
-            #     if not np.any(np.isfinite(sub)):
-            #         continue
-            #     mad_b = _rolling_mad_rows_same(sub, mad_win)
-            #     valid_scale = np.isfinite(mad_b) & (mad_b > mad_eps)
-            #     np.divide(sub, mad_b, out=sub, where=valid_scale)
-            #     np.multiply(sub, mad_gauss_scale, out=sub, where=valid_scale)
-            #     sub[~valid_scale] = np.nan
             rc[row_has_data] = rho_num
             rho[r0:r1] = rc
 
@@ -1721,59 +2036,21 @@ def main():
         act_im = act_im - med_act_im
         act_im[nan_mask] = np.nan
         
-        act_im[nan_mask] = np.nanmedian(act_im.flatten())
-        act_im_filt = ndimage.gaussian_filter(act_im, sigma=[0, 0.5, 0.5])
-        act_im_filt[nan_mask] = np.nan
-        act_im[nan_mask] = np.nan
+        # act_im[nan_mask] = np.nanmedian(act_im.flatten())
+        # act_im_filt = ndimage.gaussian_filter(act_im, sigma=[0, 0.5, 0.5])
+        # act_im_filt[nan_mask] = np.nan
+        # act_im[nan_mask] = np.nan
 
-        act_im = act_im_filt
+        # act_im = act_im_filt
 
         # act_im_hp = act_im - ndimage.gaussian_filter(act_im, sigma=[10*i for i in psf_shape])
 
-        explored = act_im.copy()
-        nan_mask = np.isnan(explored)
-        explored[nan_mask] = -np.inf
-
-        pTmp = (explored > 0) & (explored == ndimage.maximum_filter(explored, size=(1,3,3)))
-        pIM = np.zeros_like(act_im, dtype=bool)
-        while np.any(pTmp.flatten()):
-            pIM = pIM | pTmp
-            dilated_mask = ndimage.binary_dilation(pTmp, structure=np.ones((1,7,7))).astype(bool, copy=False)
-            explored[dilated_mask] = -np.inf
-            pTmp = (explored > 0) & (explored == ndimage.maximum_filter(explored, size=(1,3,3)))
-
-        # Exclude user-marked somata from seed maxima selection (already aligned to fast-Z)
+        excl_mask = None
         if params['select_soma'] and (f'DMD{DMDix+1}' in soma_masks):
-            sm = soma_masks[f'DMD{DMDix+1}']
-            if sm.shape == pIM.shape and np.any(sm):
-                pIM[sm > 0] = False
-        # Create a local maximum filter with a footprint of 3x3 pixels
-        # local_max = ndimage.maximum_filter(act_im, size=3)
+            excl_mask = soma_masks[f'DMD{DMDix+1}'] > 0
 
-        # maxima_mask = (act_im == local_max) & ~nan_mask
-        maxima_mask = pIM & ~nan_mask
-
-        # Get coordinates and values of local maxima
-        maxima_coords = np.where(maxima_mask)
-        maxima_values = act_im[maxima_mask]
-
-        # Sort maxima by value in descending order
-        # sort_idx = np.argsort(-maxima_values)
-        # maxima_coords = (maxima_coords[0][sort_idx], maxima_coords[1][sort_idx])
-        # maxima_values = maxima_values[sort_idx]
-
-        # mad = np.median(np.abs(act_im[~np.isnan(act_im)] - np.median(act_im[~np.isnan(act_im)])))
-        # thresh = 3 * 1.4826 * mad
-        # valid_maxima = maxima_values > thresh
-
-        vals_transformed = np.cbrt(maxima_values)**2
-        mad_transformed = np.median(np.abs(vals_transformed - np.median(vals_transformed)))
-        thresh = np.median(vals_transformed) + 3 * 1.4826 * mad_transformed
-        valid_maxima = vals_transformed > thresh
-        
-        maxima_coords = (maxima_coords[0][valid_maxima], maxima_coords[1][valid_maxima], maxima_coords[2][valid_maxima])
-        maxima_values = maxima_values[valid_maxima]
-        source_seeds = np.array(maxima_coords).T
+        source_seeds = get_act_im_peaks(act_im, peak_th=params.get('peakth', 3.0),
+                                        exclusion_mask=excl_mask)
 
         nSources = source_seeds.shape[0]
 
@@ -1831,8 +2108,8 @@ def main():
                                                             params['dXY'] * torch.ones(nSources, 2, dtype=torch.float32)],
                                                             dim=1))
 
-        X_support_mots = [None] * len(motIndsToKeep)
-        for i, motion_idx in enumerate(motIndsToKeep):
+        X_support_mots = [None] * uniqueMotionToKeepYX.shape[0]
+        for i in range(uniqueMotionToKeepYX.shape[0]):
             X_support_mots[i] = torch.sparse.mm(H_mots[i], A_patches[selPixIdxs,:].float()) > 0
 
         # initialize sources as gaussian blobs
@@ -1851,7 +2128,7 @@ def main():
 
         # Gaussian fitting optimization parameters
         learning_rate = 0.01
-        num_epochs = len(motIndsToKeep) * 5
+        num_epochs = uniqueMotionToKeepYX.shape[0] * 5
         gd_tol = 1e-4
         
         # phi_lowRes = torch.zeros(lowResData.shape[1], nSources+1, dtype=torch.float32)
@@ -1859,18 +2136,19 @@ def main():
 
         phi_lowRes = torch.full((lowResDataNorm.shape[1], nSources), np.nan, dtype=torch.float32)
 
-        X_mots = [None] * len(motIndsToKeep)
+        X_mots = [None] * uniqueMotionToKeepYX.shape[0]
         overall_losses = [0] * (outer_loop_iters+1)
 
-        data_for_nmf = torch.from_numpy(residualFilt.astype(np.float32, copy=False))
+        data_for_nmf = torch.from_numpy(residual.astype(np.float32, copy=False))
         # data_for_nmf = torch.from_numpy(signal.convolve2d(lowResDataNorm,np.expand_dims(decay_kernel / np.sum(decay_kernel),0),mode='same').astype(np.float32))
         # background_spatial_components = torch.from_numpy(background_spatial_components.astype(np.float32)) / torch.norm(background_spatial_components)
         
         for outer_loop_iter in range(outer_loop_iters): # outer loop
 
             # get phi_lowRes for current spatial profiles
-            for i, motion_idx in enumerate(motIndsToKeep):
-                motion_frames = (motInds == motion_idx).nonzero()[0]
+            for i in range(uniqueMotionToKeepYX.shape[0]):
+                motion_idx = i
+                motion_frames = (motIndsYX == motion_idx).nonzero()[0]
 
                 # project image space (A) into superpixel space (X)
                 X = torch.sparse.mm(H_mots[i], A[selPixIdxs,:])
@@ -1896,11 +2174,11 @@ def main():
                 overall_losses[outer_loop_iter] += loss_contribution
             print(f"Overall loss for outer loop iteration {outer_loop_iter}: {overall_losses[outer_loop_iter]}")
 
-            shuffled_indices = torch.randperm(len(motIndsToKeep))
+            shuffled_indices = torch.randperm(uniqueMotionToKeepYX.shape[0])
             for idx in tqdm(shuffled_indices,desc=f'Multiplicative NMF per motion displacement'): # loop over all motion displacements in random order
                 i = idx.item()
-                motion_idx = motIndsToKeep[i]
-                motion_frames = (motInds == motion_idx).nonzero()[0]
+                motion_idx = i
+                motion_frames = (motIndsYX == motion_idx).nonzero()[0]
 
                 # project image space (A) into superpixel space (X)
                 X = torch.sparse.mm(H_mots[i], A[selPixIdxs,:])
@@ -1994,11 +2272,11 @@ def main():
                 A_step_sel_pix /= sources_total_mass
                 # A_step_sel_pix = torch.where(sources_total_mass > 0, A_step_sel_pix / sources_total_mass, A_step_sel_pix)
                 
-                if epoch % len(motIndsToKeep) == 0:
-                    shuffled_indices = torch.randperm(len(motIndsToKeep))
+                if epoch % uniqueMotionToKeepYX.shape[0] == 0:
+                    shuffled_indices = torch.randperm(uniqueMotionToKeepYX.shape[0])
 
-                i = shuffled_indices[epoch % len(motIndsToKeep)].item()
-                motion_idx = motIndsToKeep[i]
+                i = shuffled_indices[epoch % uniqueMotionToKeepYX.shape[0]].item()
+                motion_idx = i
 
                 # Compute superpixel spatial profile
                 X_step = torch.sparse.mm(H_mots[i], A_step_sel_pix)
@@ -2019,9 +2297,9 @@ def main():
                     optim_scale_params[:,0].clamp_(min=0.3, max=5)
                     optim_scale_params[:,1].clamp_(min=0.3, max=5)
 
-                if epoch % len(motIndsToKeep) == len(motIndsToKeep)-1:
+                if epoch % uniqueMotionToKeepYX.shape[0] == uniqueMotionToKeepYX.shape[0]-1:
                     total_loss = 0
-                    for i, motion_idx in enumerate(motIndsToKeep):
+                    for i in range(uniqueMotionToKeepYX.shape[0]):
                         X_step = torch.sparse.mm(H_mots[i], A_step_sel_pix)
                         norms = torch.norm(X_step, dim=0, keepdim=True)
                         X_step = torch.where(norms > 0, X_step / norms, X_step)
@@ -2031,7 +2309,7 @@ def main():
 
                     # Check for convergence
                     losses.append(total_loss.item())
-                    if epoch // len(motIndsToKeep) > 0 and abs(losses[-1] - losses[-2]) < gd_tol:
+                    if epoch // uniqueMotionToKeepYX.shape[0] > 0 and abs(losses[-1] - losses[-2]) < gd_tol:
                         print(f"Converged at epoch {epoch+1} with loss: {loss.item():.8f}")
                         break
 
@@ -2047,8 +2325,9 @@ def main():
             # A = torch.where(sources_total_mass > 0, A / sources_total_mass, A)
 
             # get phi_lowRes for current spatial profiles
-            for i, motion_idx in enumerate(motIndsToKeep):
-                motion_frames = (motInds == motion_idx).nonzero()[0]
+            for i in range(uniqueMotionToKeepYX.shape[0]):
+                motion_idx = i
+                motion_frames = (motIndsYX == motion_idx).nonzero()[0]
 
                 # project image space (A) into superpixel space (X)
                 X = torch.sparse.mm(H_mots[i], A[selPixIdxs,:])
@@ -2081,8 +2360,9 @@ def main():
             if (outer_loop_iter+1) % 4 == 3: # prune sources
                 residual = torch.zeros_like(data_for_nmf, dtype=torch.float32)
                 residual[:] = np.nan
-                for i in range(len(motIndsToKeep)):
-                    motion_frames = (motInds == motIndsToKeep[i]).nonzero()[0]
+                for i in range(uniqueMotionToKeepYX.shape[0]):
+                    motion_idx = i
+                    motion_frames = (motIndsYX == motion_idx).nonzero()[0]
                     X = torch.sparse.mm(H_mots[i], A[selPixIdxs,:])
                     # X = torch.concat((X,background_spatial_components[:,i].unsqueeze(-1)),dim=1)
                     residual[:,motion_frames] = data_for_nmf[:,motion_frames] - X @ phi_lowRes[motion_frames,:].T
@@ -2100,8 +2380,9 @@ def main():
                     # tmp_A = A[selPixIdxs,j].unsqueeze(1).clone()
                     # tmp_A[~validPixs] = 0
 
-                    for i in range(len(motIndsToKeep)):
-                        motion_frames = (motInds == motIndsToKeep[i]).nonzero()[0]
+                    for i in range(uniqueMotionToKeepYX.shape[0]):
+                        motion_idx = i
+                        motion_frames = (motIndsYX == motion_idx).nonzero()[0]
 
                         # X = torch.sparse.mm(H_mots[i], tmp_A)
                         X = torch.sparse.mm(H_mots[i], A[selPixIdxs,j].unsqueeze(1))
@@ -2125,8 +2406,9 @@ def main():
                 phi_lowRes = phi_lowRes[:,keepSources]
         
         # get phi_lowRes for current spatial profiles
-        for i, motion_idx in enumerate(motIndsToKeep):
-            motion_frames = (motInds == motion_idx).nonzero()[0]
+        for i in range(uniqueMotionToKeepYX.shape[0]):
+            motion_idx = i
+            motion_frames = (motIndsYX == motion_idx).nonzero()[0]
 
             # project image space (A) into superpixel space (X)
             X = torch.sparse.mm(H_mots[i], A[selPixIdxs,:])
@@ -2150,8 +2432,9 @@ def main():
                                               dr=dr, 
                                               trialTable=trialTable, 
                                               A_final=A,
-                                              uniqueMotionDS=uniqueMotion,
-                                              motIndsToKeepDS=motIndsToKeep,
+                                              uniqueMotionDS=uniqueMotionToKeepYX,
+                                              motIndsToKeepDS=np.arange(uniqueMotionToKeepYX.shape[0]),
+                                              median_z=median_z,
                                               psf=psf,
                                               soma_sps=soma_sps[f'DMD{DMDix+1}'])
 
