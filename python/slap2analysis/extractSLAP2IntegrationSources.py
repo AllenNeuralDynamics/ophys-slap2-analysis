@@ -43,12 +43,15 @@ from aind_data_schema_models.units import MemoryUnit
 from aind_data_schema_models.system_architecture import OperatingSystem, CPUArchitecture
 
 def to_serializable(val):
-    if isinstance(val, (np.integer, np.int32, np.int64, np.uint8)):
-        return int(val)
-    elif isinstance(val, (np.floating, np.float32, np.float64)):
-        return float(val)
-    elif isinstance(val, np.ndarray):
+    """Recursively convert numpy types and arrays to JSON-friendly Python values."""
+    if isinstance(val, dict):
+        return {k: to_serializable(v) for k, v in val.items()}
+    if isinstance(val, (list, tuple)):
+        return type(val)(to_serializable(v) for v in val)
+    if isinstance(val, np.ndarray):
         return val.tolist()
+    if isinstance(val, np.generic):
+        return val.item()
     return val
 
 def nearest_interp(x, xp, yp):
@@ -474,7 +477,6 @@ def _detect_peaks_2d(act_im_2d, exclusion_mask, mu_bg, sigma_bg, peak_thresh, pe
         # Process each CC's new peak
         modified_ccs = []
         for (pY_new, pX_new), cc_label in new_peaks:
-            print(f"peak of amp {act_im_2d[pY_new, pX_new]}")
             amp_new = act_im_2d[pY_new, pX_new] * AMP_SCALE
 
             n_before = thetaf.shape[0]
@@ -997,6 +999,116 @@ def create_parameter_gui():
     
     return result
 
+
+def _soma_superpixel_lists_from_mask(mask_fastz, sp_fastz, sp_rows, sp_cols):
+    """One list entry per ROI label (1..max); empty if no soma voxels."""
+    mx = int(np.max(mask_fastz))
+    if mx < 1:
+        return []
+    return [
+        np.flatnonzero(mask_fastz[sp_fastz, sp_rows, sp_cols] == roi + 1)
+        for roi in range(mx)
+    ]
+
+
+def save_user_soma_annotation_h5(dr, soma_masks, n_dmds, soma_geo=None):
+    """Write binary (0/1) fast-Z soma masks for all DMDs into dr/user_annotation.h5.
+
+    If a DMD key is missing from soma_masks, an all-zero mask is written when soma_geo
+    is provided (shape taken from soma_geo); otherwise that DMD is skipped.
+    """
+    path = os.path.join(dr, 'user_annotation.h5')
+    with h5py.File(path, 'w') as f:
+        f.attrs['description'] = 'Binary soma mask per DMD (uint8: 0=background, 1=selected), shape (Z_fast, Y, X).'
+        for DMDix in range(n_dmds):
+            key = f'DMD{DMDix+1}'
+            if key in soma_masks:
+                m = np.asarray(soma_masks[key], dtype=np.int8)
+            elif soma_geo is not None and key in soma_geo:
+                geo = soma_geo[key]
+                expected = (geo['num_fast_z'], geo['yx_shape'][0], geo['yx_shape'][1])
+                m = np.zeros(expected, dtype=np.int8)
+            else:
+                continue
+            binary = (m > 0).astype(np.uint8)
+            grp = f.create_group(key)
+            grp.create_dataset('mask', data=binary, compression='gzip', shuffle=True)
+
+
+def load_user_soma_annotation_h5(annotation_path, n_dmds, soma_geo):
+    """
+    Load soma masks from user_annotation.h5 when the file exists.
+
+    Each DMD group may be absent: that path is treated as no soma selection (all-zero
+    mask, empty soma_sps). If a mask is present but its shape does not match the current
+    experiment geometry, that DMD is also treated as no selection (with a console warning).
+
+    Returns (skip_manual, soma_masks, soma_sps). skip_manual is True iff the file was
+    read successfully and at least one DMD had a valid mask shape (so OpenCV annotation
+    can be skipped). If the file is missing, unreadable, or no DMD had a valid mask,
+    returns (False, {}, {}) and the caller runs full manual selection for all DMDs.
+
+    soma_masks values are int8 (0/1) when skip_manual is True; every DMD key is populated.
+    """
+    if not os.path.exists(annotation_path):
+        return False, {}, {}
+
+    soma_masks = {}
+    soma_sps = {}
+    any_valid = False
+    try:
+        with h5py.File(annotation_path, 'r') as hf:
+            for DMDix in range(n_dmds):
+                key = f'DMD{DMDix+1}'
+                geo = soma_geo[key]
+                expected = (geo['num_fast_z'], geo['yx_shape'][0], geo['yx_shape'][1])
+                empty_mask = np.zeros(expected, dtype=np.int8)
+
+                if key not in hf or 'mask' not in hf[key]:
+                    soma_masks[key] = empty_mask
+                    soma_sps[key] = []
+                    continue
+
+                arr = hf[key]['mask'][()]
+                if arr.shape != expected:
+                    print(
+                        f'user_annotation.h5: {key}/mask has shape {arr.shape}, '
+                        f'expected {expected}; treating this DMD as no selection.'
+                    )
+                    soma_masks[key] = empty_mask
+                    soma_sps[key] = []
+                    continue
+
+                mask_fastz = (arr > 0).astype(np.int8)
+                soma_masks[key] = mask_fastz
+                soma_sps[key] = _soma_superpixel_lists_from_mask(
+                    mask_fastz, geo['sp_fastz'], geo['sp_rows'], geo['sp_cols']
+                )
+                any_valid = True
+                plane_counts = [
+                    int(np.count_nonzero(mask_fastz[z])) for z in range(mask_fastz.shape[0])
+                ]
+                nz_planes = [z for z, c in enumerate(plane_counts) if c > 0]
+                if nz_planes:
+                    per_plane = ", ".join(f"plane {z}: {plane_counts[z]}" for z in nz_planes)
+                    print(
+                        f"Loaded soma mask for {key}: "
+                        f"{len(nz_planes)} fast-Z plane(s) with nonzero voxels — {per_plane}"
+                    )
+                else:
+                    print(
+                        f"Loaded soma mask for {key}: "
+                        f"no nonzero voxels on any fast-Z plane (shape {mask_fastz.shape})"
+                    )
+
+        if not any_valid:
+            return False, {}, {}
+        return True, soma_masks, soma_sps
+    except Exception as e:
+        print(f'Could not read {annotation_path}: {e}')
+        return False, {}, {}
+
+
 def main():
     # load SLAP2 data folder
     dr = filedialog.askdirectory(initialdir = 'Z:\\scratch\\ophys\\Michael', \
@@ -1180,116 +1292,154 @@ def main():
     soma_sps = {}
     params['alignHz'] = {}
     if params['select_soma']:
-        print('Manually select soma mask on each DMD based on the reference image')
-        print('Controls: E=edit/add ROIs on current plane, N/P=next/prev plane, ESC/Q=finish DMD')
+        annotation_path = os.path.join(dr, 'user_annotation.h5')
+        soma_geo = {}
         for DMDix in range(nDMDs):
-            aData = spio.loadmat(trialTable['fnAdataInt'][DMDix,firstValidTrial][0])['aData'][0,0]
-            params['numChannels'] = aData['numChannels'][0,0]
-            params['alignHz'][f'DMD{DMDix+1}'] = aData['alignHz'][0,0]
+            aData = spio.loadmat(trialTable['fnAdataInt'][DMDix, firstValidTrial][0])['aData'][0, 0]
+            params['numChannels'] = aData['numChannels'][0, 0]
+            params['alignHz'][f'DMD{DMDix+1}'] = aData['alignHz'][0, 0]
 
             avg_motionR = int(np.nanmedian(np.round(aData['motionDSr'].T[0])))
             avg_motionC = int(np.nanmedian(np.round(aData['motionDSc'].T[0])))
             avg_motionZ = int(np.nanmedian(np.round(aData['motionDSz'].T[0])))
 
-            soma_sps[f'DMD{DMDix+1}'] = []
             ref = refStack[f'DMD{DMDix+1}']  # [channels, z, y, x]
             num_ref_z = ref.shape[1]
             yx_shape = (ref.shape[2], ref.shape[3])
-            # choose channel with largest mean intensity
             ch_means = [np.nanmean(ref[c]) for c in range(ref.shape[0])]
             best_ch = int(np.argmax(ch_means)) if len(ch_means) > 0 else 0
 
-            # Map fast-Z to ref-Z for viewing; adjust potential 1-based indexing
             z_map = np.array(fastZ2RefZ[f'DMD{DMDix+1}'] + avg_motionZ).reshape(-1) - 1
             num_fast_z = z_map.shape[0]
-            
-            sp_fastz = subsampleMatrixInds[f'DMD{DMDix+1}'][:,0] // (yx_shape[0]*yx_shape[1])
-            sp_cols = avg_motionC + (subsampleMatrixInds[f'DMD{DMDix+1}'][:,0] - sp_fastz * (yx_shape[0]*yx_shape[1])) // yx_shape[0]
-            sp_rows = avg_motionR + subsampleMatrixInds[f'DMD{DMDix+1}'][:,0] % yx_shape[0]
+
+            sp_fastz = subsampleMatrixInds[f'DMD{DMDix+1}'][:, 0] // (yx_shape[0] * yx_shape[1])
+            sp_cols = avg_motionC + (
+                subsampleMatrixInds[f'DMD{DMDix+1}'][:, 0] - sp_fastz * (yx_shape[0] * yx_shape[1])
+            ) // yx_shape[0]
+            sp_rows = avg_motionR + subsampleMatrixInds[f'DMD{DMDix+1}'][:, 0] % yx_shape[0]
             sp_mask = np.zeros((num_fast_z, *yx_shape), dtype=bool)
-            
-            # clip to valid bounds
-            valid = (sp_rows >= 0) & (sp_rows < yx_shape[0]) & (sp_cols >= 0) & (sp_cols < yx_shape[1]) & (sp_fastz >= 0) & (sp_fastz < num_fast_z)
+            valid = (
+                (sp_rows >= 0)
+                & (sp_rows < yx_shape[0])
+                & (sp_cols >= 0)
+                & (sp_cols < yx_shape[1])
+                & (sp_fastz >= 0)
+                & (sp_fastz < num_fast_z)
+            )
             if np.any(valid):
                 sp_mask[sp_fastz[valid], sp_rows[valid], sp_cols[valid]] = True
 
-            # mask in fast-Z space (store labels per plane)
-            mask_fastz = np.zeros((num_fast_z, *yx_shape), dtype=np.int8)
+            soma_geo[f'DMD{DMDix+1}'] = {
+                'ref': ref,
+                'num_ref_z': num_ref_z,
+                'yx_shape': yx_shape,
+                'best_ch': best_ch,
+                'z_map': z_map,
+                'num_fast_z': num_fast_z,
+                'sp_fastz': sp_fastz,
+                'sp_rows': sp_rows,
+                'sp_cols': sp_cols,
+                'sp_mask': sp_mask,
+            }
 
-            window_name = f'Select soma ROI(s) DMD{DMDix+1}'
-            cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-            cv2.resizeWindow(window_name, 800, 500)
-            cv2.createTrackbar('z', window_name, 0, max(0, num_fast_z-1), lambda v: None)
+        loaded_ok, masks_ld, sps_ld = load_user_soma_annotation_h5(annotation_path, nDMDs, soma_geo)
+        if loaded_ok:
+            soma_masks.update(masks_ld)
+            soma_sps.update(sps_ld)
+            print(
+                f'Loaded soma masks from {annotation_path}; skipping manual annotation '
+                f'(DMDs without a valid mask in the file are treated as no selection).'
+            )
+        else:
+            print('Manually select soma mask on each DMD based on the reference image')
+            print('Controls: E=edit/add ROIs on current plane, N/P=next/prev plane, ESC/Q=finish DMD')
+            for DMDix in range(nDMDs):
+                dmd_key = f'DMD{DMDix+1}'
+                g = soma_geo[dmd_key]
+                ref = g['ref']
+                num_ref_z = g['num_ref_z']
+                yx_shape = g['yx_shape']
+                best_ch = g['best_ch']
+                z_map = g['z_map']
+                num_fast_z = g['num_fast_z']
+                sp_mask = g['sp_mask']
+                sp_fastz = g['sp_fastz']
+                sp_rows = g['sp_rows']
+                sp_cols = g['sp_cols']
 
-            while True:
-                curr_fz = int(np.clip(cv2.getTrackbarPos('z', window_name), 0, max(0, num_fast_z-1)))
-                refz = int(np.clip(z_map[curr_fz], 0, max(0, num_ref_z-1)))
+                mask_fastz = np.zeros((num_fast_z, *yx_shape), dtype=np.int8)
 
-                plane = ref[best_ch, refz]
-                im = np.nan_to_num(plane, nan=0.0)
-                vmin = np.percentile(im, 1)
-                vmax = np.percentile(im, 99.5)
-                if not np.isfinite(vmin):
-                    vmin = float(np.nanmin(im)) if np.any(np.isfinite(im)) else 0.0
-                if not np.isfinite(vmax):
-                    vmax = float(np.nanmax(im)) if np.any(np.isfinite(im)) else 1.0
-                if vmax <= vmin:
-                    vmax = vmin + 1.0
-                im8 = np.clip((im - vmin) / (vmax - vmin), 0, 1)
-                im8 = (im8 * 255).astype(np.uint8)
+                window_name = f'Select soma ROI(s) DMD{DMDix+1}'
+                cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+                cv2.resizeWindow(window_name, 800, 500)
+                cv2.createTrackbar('z', window_name, 0, max(0, num_fast_z - 1), lambda v: None)
 
-                # show overlay text
-                disp = cv2.cvtColor(im8, cv2.COLOR_GRAY2BGR)
-                text = f'FastZ {curr_fz+1}/{num_fast_z} (RefZ {refz+1}/{num_ref_z}) | E=edit, N/P=nav, ESC=done'
-                cv2.putText(disp, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2, cv2.LINE_AA)
-                # overlay superpixel mask (green) on current plane
-                if np.any(sp_mask[curr_fz]):
-                    sp_color = np.zeros_like(disp)
-                    sp_color[sp_mask[curr_fz]] = (0, 255, 0)
-                    alpha_sp = 0.25
-                    disp = cv2.addWeighted(disp, 1 - alpha_sp, sp_color, alpha_sp, 0)
-                # overlay drawn soma mask (red)
-                if (mask_fastz[curr_fz] > 0).any():
-                    roi_color = np.zeros_like(disp)
-                    roi_color[mask_fastz[curr_fz] > 0] = (0, 0, 255)
-                    alpha_roi = 0.3
-                    disp = cv2.addWeighted(disp, 1 - alpha_roi, roi_color, alpha_roi, 0)
-                cv2.imshow(window_name, disp)
+                while True:
+                    curr_fz = int(np.clip(cv2.getTrackbarPos('z', window_name), 0, max(0, num_fast_z - 1)))
+                    refz = int(np.clip(z_map[curr_fz], 0, max(0, num_ref_z - 1)))
 
-                key = cv2.waitKey(50) & 0xFF
-                if key == ord('e'):
-                    edit_name = f'Edit ROIs z={curr_fz+1}'
-                    # prepare edit image with superpixel overlay for context
-                    edit_disp = cv2.cvtColor(im8, cv2.COLOR_GRAY2BGR)
+                    plane = ref[best_ch, refz]
+                    im = np.nan_to_num(plane, nan=0.0)
+                    vmin = np.percentile(im, 1)
+                    vmax = np.percentile(im, 99.5)
+                    if not np.isfinite(vmin):
+                        vmin = float(np.nanmin(im)) if np.any(np.isfinite(im)) else 0.0
+                    if not np.isfinite(vmax):
+                        vmax = float(np.nanmax(im)) if np.any(np.isfinite(im)) else 1.0
+                    if vmax <= vmin:
+                        vmax = vmin + 1.0
+                    im8 = np.clip((im - vmin) / (vmax - vmin), 0, 1)
+                    im8 = (im8 * 255).astype(np.uint8)
+
+                    disp = cv2.cvtColor(im8, cv2.COLOR_GRAY2BGR)
+                    text = f'FastZ {curr_fz+1}/{num_fast_z} (RefZ {refz+1}/{num_ref_z}) | E=edit, N/P=nav, ESC=done'
+                    cv2.putText(disp, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
                     if np.any(sp_mask[curr_fz]):
-                        sp_color = np.zeros_like(edit_disp)
+                        sp_color = np.zeros_like(disp)
                         sp_color[sp_mask[curr_fz]] = (0, 255, 0)
                         alpha_sp = 0.25
-                        edit_disp = cv2.addWeighted(edit_disp, 1 - alpha_sp, sp_color, alpha_sp, 0)
-                        rois = cv2.selectROIs(edit_name, edit_disp, showCrosshair=True, fromCenter=False)
-                        cv2.resizeWindow(edit_name, 800, 500)
-                        if rois is not None and len(rois) > 0:
-                            next_label = int(np.max(mask_fastz)) + 1
-                            for (x, y, w, h) in rois:
-                                mask_fastz[curr_fz, y:y+h, x:x+w] = next_label
-                                next_label += 1
-                            print(f'Added {len(rois)} ROI(s) at fast-Z {curr_fz+1} for DMD{DMDix+1}')
-                        cv2.destroyWindow(edit_name)
-                elif key == ord('n'):
-                    curr_fz = min(curr_fz + 1, num_fast_z - 1)
-                    cv2.setTrackbarPos('z', window_name, curr_fz)
-                elif key == ord('p'):
-                    curr_fz = max(curr_fz - 1, 0)
-                    cv2.setTrackbarPos('z', window_name, curr_fz)
-                elif key in (27, ord('q')):
-                    break
+                        disp = cv2.addWeighted(disp, 1 - alpha_sp, sp_color, alpha_sp, 0)
+                    if (mask_fastz[curr_fz] > 0).any():
+                        roi_color = np.zeros_like(disp)
+                        roi_color[mask_fastz[curr_fz] > 0] = (0, 0, 255)
+                        alpha_roi = 0.3
+                        disp = cv2.addWeighted(disp, 1 - alpha_roi, roi_color, alpha_roi, 0)
+                    cv2.imshow(window_name, disp)
 
-            cv2.destroyWindow(window_name)
+                    keycode = cv2.waitKey(50) & 0xFF
+                    if keycode == ord('e'):
+                        edit_name = f'Edit ROIs z={curr_fz+1}'
+                        edit_disp = cv2.cvtColor(im8, cv2.COLOR_GRAY2BGR)
+                        if np.any(sp_mask[curr_fz]):
+                            sp_color = np.zeros_like(edit_disp)
+                            sp_color[sp_mask[curr_fz]] = (0, 255, 0)
+                            alpha_sp = 0.25
+                            edit_disp = cv2.addWeighted(edit_disp, 1 - alpha_sp, sp_color, alpha_sp, 0)
+                            rois = cv2.selectROIs(edit_name, edit_disp, showCrosshair=True, fromCenter=False)
+                            cv2.resizeWindow(edit_name, 800, 500)
+                            if rois is not None and len(rois) > 0:
+                                next_label = int(np.max(mask_fastz)) + 1
+                                for (x, y, w, h) in rois:
+                                    mask_fastz[curr_fz, y : y + h, x : x + w] = next_label
+                                    next_label += 1
+                                print(f'Added {len(rois)} ROI(s) at fast-Z {curr_fz+1} for DMD{DMDix+1}')
+                            cv2.destroyWindow(edit_name)
+                    elif keycode == ord('n'):
+                        curr_fz = min(curr_fz + 1, num_fast_z - 1)
+                        cv2.setTrackbarPos('z', window_name, curr_fz)
+                    elif keycode == ord('p'):
+                        curr_fz = max(curr_fz - 1, 0)
+                        cv2.setTrackbarPos('z', window_name, curr_fz)
+                    elif keycode in (27, ord('q')):
+                        break
 
-            soma_masks[f'DMD{DMDix+1}'] = mask_fastz
+                cv2.destroyWindow(window_name)
 
-            for roi in range(np.max(mask_fastz)):
-                soma_sps[f'DMD{DMDix+1}'].append(np.flatnonzero(mask_fastz[sp_fastz, sp_rows, sp_cols] == roi + 1))
+                soma_masks[dmd_key] = mask_fastz
+                soma_sps[dmd_key] = _soma_superpixel_lists_from_mask(mask_fastz, sp_fastz, sp_rows, sp_cols)
+
+            save_user_soma_annotation_h5(dr, soma_masks, nDMDs, soma_geo=soma_geo)
+            print(f'Saved soma masks to {annotation_path}')
 
     # Get dilation 17 PSF or load in from file
     pattern = f"**/*DMD*-REFERENCE*"
@@ -2553,7 +2703,7 @@ def main():
                 code=Code(
                     url="https://github.com/AllenNeuralDynamics/ophys-slap2-analysis/blob/main/matlab/preprocessing/integrationRegistration.m",
                     version=version,
-                    parameters=align_params
+                    parameters={key: to_serializable(val) for key, val in align_params.items()},
                 ),
             ),
             DataProcess(
