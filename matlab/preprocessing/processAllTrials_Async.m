@@ -17,7 +17,7 @@ for i = 1:numel(validTrials)
             disp(['Error processing trial: ' int2str(nLoad) '\n Continuing...'])
         end
     end
-    disp(['Processing dataset: ' fns{nLoad}])
+    disp(['Processing trial ' int2str(validTrials(i)) ' from ' fns{nLoad}])
     %Y = squeeze(CD.Yobs(:,1,:));
     Y = permute(CD.Yobs, [1 3 2]);
     resultsFuture = extractTrial(Y,CD.Finv, sources, any(selPix,3), params);
