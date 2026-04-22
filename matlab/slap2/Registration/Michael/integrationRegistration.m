@@ -318,7 +318,7 @@ assert(any(motionMetric == validMotionMetrics), ['Unknown motionMetric: ' char(m
 
 % how much change is allowed in each dimension at each step
 searchRadius = aData.clipShift;
-searchRadiusZ = ceil(searchRadius / 2);
+searchRadiusZ = ceil(searchRadius / 4);
 
 motionDS = nan(nDSframes,3);
 brightnessDS = nan(nDSframes,length(channels));
