@@ -1287,21 +1287,29 @@ def main():
             else:
                 print(f"No matching files found for DMD{DMDix+1}")
 
-    # Optional manual soma selection on reference images (scroll through fast-Z planes)
-    soma_masks = {}
-    soma_sps = {}
+    # Always load per-DMD acquisition params (numChannels, alignHz) and motion medians
+    # from aData, regardless of whether manual soma selection is enabled.
     params['alignHz'] = {}
+    aData_by_dmd = {}
+    motion_medians = {}
+    for DMDix in range(nDMDs):
+        aData = spio.loadmat(trialTable['fnAdataInt'][DMDix, firstValidTrial][0])['aData'][0, 0]
+        params['numChannels'] = aData['numChannels'][0, 0]
+        params['alignHz'][f'DMD{DMDix+1}'] = aData['alignHz'][0, 0]
+        aData_by_dmd[f'DMD{DMDix+1}'] = aData
+        motion_medians[f'DMD{DMDix+1}'] = (
+            int(np.nanmedian(np.round(aData['motionDSr'].T[0]))),
+            int(np.nanmedian(np.round(aData['motionDSc'].T[0]))),
+            int(np.nanmedian(np.round(aData['motionDSz'].T[0]))),
+        )
+
+    # Optional manual soma selection on reference images (scroll through fast-Z planes)
+    soma_sps = {f'DMD{DMDix+1}': [] for DMDix in range(nDMDs)}
     if params['select_soma']:
         annotation_path = os.path.join(dr, 'user_annotation.h5')
         soma_geo = {}
         for DMDix in range(nDMDs):
-            aData = spio.loadmat(trialTable['fnAdataInt'][DMDix, firstValidTrial][0])['aData'][0, 0]
-            params['numChannels'] = aData['numChannels'][0, 0]
-            params['alignHz'][f'DMD{DMDix+1}'] = aData['alignHz'][0, 0]
-
-            avg_motionR = int(np.nanmedian(np.round(aData['motionDSr'].T[0])))
-            avg_motionC = int(np.nanmedian(np.round(aData['motionDSc'].T[0])))
-            avg_motionZ = int(np.nanmedian(np.round(aData['motionDSz'].T[0])))
+            avg_motionR, avg_motionC, avg_motionZ = motion_medians[f'DMD{DMDix+1}']
 
             ref = refStack[f'DMD{DMDix+1}']  # [channels, z, y, x]
             num_ref_z = ref.shape[1]
@@ -1372,10 +1380,15 @@ def main():
                 window_name = f'Select soma ROI(s) DMD{DMDix+1}'
                 cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
                 cv2.resizeWindow(window_name, 800, 500)
-                cv2.createTrackbar('z', window_name, 0, max(0, num_fast_z - 1), lambda v: None)
+                # OpenCV requires trackbar count >= 1; guard against single-plane data.
+                has_z_trackbar = num_fast_z > 1
+                if has_z_trackbar:
+                    cv2.createTrackbar('z', window_name, 0, num_fast_z - 1, lambda v: None)
 
+                curr_fz = 0
                 while True:
-                    curr_fz = int(np.clip(cv2.getTrackbarPos('z', window_name), 0, max(0, num_fast_z - 1)))
+                    if has_z_trackbar:
+                        curr_fz = int(np.clip(cv2.getTrackbarPos('z', window_name), 0, num_fast_z - 1))
                     refz = int(np.clip(z_map[curr_fz], 0, max(0, num_ref_z - 1)))
 
                     plane = ref[best_ch, refz]
@@ -1415,21 +1428,23 @@ def main():
                             sp_color[sp_mask[curr_fz]] = (0, 255, 0)
                             alpha_sp = 0.25
                             edit_disp = cv2.addWeighted(edit_disp, 1 - alpha_sp, sp_color, alpha_sp, 0)
-                            rois = cv2.selectROIs(edit_name, edit_disp, showCrosshair=True, fromCenter=False)
-                            cv2.resizeWindow(edit_name, 800, 500)
-                            if rois is not None and len(rois) > 0:
-                                next_label = int(np.max(mask_fastz)) + 1
-                                for (x, y, w, h) in rois:
-                                    mask_fastz[curr_fz, y : y + h, x : x + w] = next_label
-                                    next_label += 1
-                                print(f'Added {len(rois)} ROI(s) at fast-Z {curr_fz+1} for DMD{DMDix+1}')
-                            cv2.destroyWindow(edit_name)
+                        rois = cv2.selectROIs(edit_name, edit_disp, showCrosshair=True, fromCenter=False)
+                        cv2.resizeWindow(edit_name, 800, 500)
+                        if rois is not None and len(rois) > 0:
+                            next_label = int(np.max(mask_fastz)) + 1
+                            for (x, y, w, h) in rois:
+                                mask_fastz[curr_fz, y : y + h, x : x + w] = next_label
+                                next_label += 1
+                            print(f'Added {len(rois)} ROI(s) at fast-Z {curr_fz+1} for DMD{DMDix+1}')
+                        cv2.destroyWindow(edit_name)
                     elif keycode == ord('n'):
                         curr_fz = min(curr_fz + 1, num_fast_z - 1)
-                        cv2.setTrackbarPos('z', window_name, curr_fz)
+                        if has_z_trackbar:
+                            cv2.setTrackbarPos('z', window_name, curr_fz)
                     elif keycode == ord('p'):
                         curr_fz = max(curr_fz - 1, 0)
-                        cv2.setTrackbarPos('z', window_name, curr_fz)
+                        if has_z_trackbar:
+                            cv2.setTrackbarPos('z', window_name, curr_fz)
                     elif keycode in (27, ord('q')):
                         break
 
