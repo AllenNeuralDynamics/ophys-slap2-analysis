@@ -145,6 +145,17 @@ for dmdIdx = 1:nDMDs
     [masks, maskImage, sourceRoiIdx] = getIntegrationMasks(hMDF);
     [refIM, outlines] = loadReferenceImage(dr, dmdIdx, hMDF, masks, params);
 
+    figure;
+    imshow(refIM(:,:,1), []);
+    hold on;
+    for rr = 1:size(masks,3)
+        B = bwboundaries(masks(:,:,rr));
+        for bb = 1:numel(B)
+            plot(B{bb}(:,2), B{bb}(:,1), 'c', 'LineWidth', 1.5);
+        end
+    end
+    title(sprintf('DMD%d masks over refIM inside MATLAB extraction', dmdIdx));
+
     if params.manualROIs
         assert(~isempty(refIM), ['manualROIs=true requires a reference image. ' ...
             'Set saveRefImages/loadRefImages to true or provide a compatible reference TIFF.']);
