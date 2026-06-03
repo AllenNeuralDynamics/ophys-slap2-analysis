@@ -671,7 +671,7 @@ catch ME
 end
 
 try
-    A = ScanImageTiffReader(fullfile(refFn.folder, refFn.name));
+    A = ScanImageTiffReader.ScanImageTiffReader(fullfile(refFn.folder, refFn.name));
     IDs = A.descriptions;
     z = zeros(numel(IDs), 1);
     ch = zeros(numel(IDs), 1);
