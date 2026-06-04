@@ -1,52 +1,45 @@
 function summary = extractDendrites_new(dr_or_pathToTrialTable, paramsIn)
-%EXTRACTDENDRITES Extract SLAP2 dendritic voltage traces with bounded memory use.
+%EXTRACTDENDRITES_NEW Extract SLAP2 dendritic-voltage ROI traces.
 %
-%   summary = extractDendrites(dr_or_pathToTrialTable, paramsIn)
+%   summary = extractDendrites_new(dr_or_pathToTrialTable, paramsIn)
 %
-%   This refactored version keeps the existing SLAP2 Trace backend but avoids
-%   holding all ROI traces in memory at once. Each ROI or small ROI batch is
-%   processed, cast to the requested precision, optionally sliced by trial line
-%   ranges, and written to an HDF5 file immediately.
+%   This pipeline reads a SLAP2 trial table, discovers DMD integration ROIs,
+%   extracts voltage traces from the SLAP2 Trace backend, and writes large trace
+%   arrays directly to HDF5 while saving lightweight session/ROI metadata to a
+%   MATLAB summary file. It supports continuous CYCLE acquisitions and trial-file
+%   acquisitions, with optional trial-sliced, continuous, or combined outputs.
 %
-%   Recommended default usage:
+%   Important conventions:
+%       - ROI masks are stored in DMD/image pixel coordinates as
+%         [dmdPixelsPerColumn x dmdPixelsPerRow x nROIs].
+%       - When available, stored ROI mask images are preferred over masks
+%         reconstructed from shapeData. This matches the summarize_LoCo.m access
+%         pattern and avoids small coordinate offsets from shapeData conventions.
+%       - Reference images are optional metadata/QC outputs; trace extraction only
+%         requires masks and .dat/.meta files.
 %
+%   Typical usage:
 %       params.outputMode = 'trial';      % 'trial', 'continuous', or 'both'
-%       params.storageMode = 'h5';        % currently recommended
+%       params.storageMode = 'h5';        % recommended
 %       params.precision = 'single';
 %       params.numWorkers = 4;
 %       params.maxConcurrentROIs = 2;
-%       params.makePlots = false;
-%       % By default, outputs are saved in a subfolder beside trialTable.mat.
-%       % Override params.outputDir to choose a custom location.
-%       summary = extractDendrites(sessionDir, params);
+%       summary = extractDendrites_new(sessionDir, params);
 %
-%   HDF5 output schema:
+%   Outputs:
+%       dendriticVoltageSummary-YYmmDD-HHMMSS.mat
+%           Summary metadata, DMD ROI masks, reference images, trial line ranges,
+%           ROI table, extraction status, and path to paired HDF5 traces.
 %
-%       /traces/trial_0001         [nAlignedLinesThisTrial x nTotalROIs]
-%       /traces/trial_0002         [nAlignedLinesThisTrial x nTotalROIs]
-%       ...
-%
-%       /traces/continuous/DMD1    [nLinesDMD1 x nROIsDMD1]
-%       /traces/continuous/DMD2    [nLinesDMD2 x nROIsDMD2]
-%
-%   Trial datasets are sized by the union of valid DMD line ranges, and each
-%   DMD is written with a row offset relative to trialFirstLineGlobal to preserve
-%   acquisition-time alignment across DMDs.
-%
-%   The lightweight MAT summary stores masks, metadata, ROI mappings, line
-%   ranges, output paths, and extraction status. Large traces are stored in HDF5.
-%
-%   Notes:
-%       - The SLAP2 DataFile/loadParsePlan method must be compatible with the
-%         metadata format saved by the acquisition software. For newer metadata
-%         files where AcquisitionContainer.AcquisitionPlan is empty but
-%         AcquisitionContainer.ParsePlan is populated, replace loadParsePlan.m
-%         with the companion patched version included with this file.
-%       - This is a conservative memory-safety refactor. It does not yet rewrite
-%         the underlying SLAP2 Trace/TracePixel backend to process all ROIs in a
-%         single pass through the .dat file.
+%       dendriticVoltageTraces-YYmmDD-HHMMSS.h5
+%           /traces/trial_####       [nTrialLines x nTotalROIs]
+%           /traces/continuous/DMD#  [nDmdLines x nLocalROIs]
 
 import ScanImageTiffReader.ScanImageTiffReader
+
+% -------------------------------------------------------------------------
+% Resolve inputs, output locations, and run parameters
+% -------------------------------------------------------------------------
 
 if nargin < 1 || isempty(dr_or_pathToTrialTable)
     [trialTablefn, dr] = uigetfile({'*.mat', 'MAT-files (*.mat)'}, 'Select trialTable.mat');
@@ -83,6 +76,10 @@ h5Path = fullfile(params.outputDir, ['dendriticVoltageTraces-' timestamp '.h5'])
 if strcmpi(params.storageMode, 'h5') && exist(h5Path, 'file') && ~params.resume
     delete(h5Path);
 end
+
+% -------------------------------------------------------------------------
+% Load trial table and initialize summary metadata
+% -------------------------------------------------------------------------
 
 fprintf('Loading trial table: %s\n', fullfile(dr, trialTablefn));
 S = load(fullfile(dr, trialTablefn), 'trialTable');
@@ -126,6 +123,10 @@ nAnalysisROIs = zeros(1, nDMDs);
 roiRecords = struct('globalRoiIdx', {}, 'dmdIdx', {}, 'localRoiIdx', {}, ...
     'sourceRoiIdx', {}, 'nPixels', {}, 'isManual', {});
 
+% -------------------------------------------------------------------------
+% Discover DMD ROIs, reference images, and ROI bookkeeping
+% -------------------------------------------------------------------------
+
 fprintf('Discovering ROIs and reference images...\n');
 for dmdIdx = 1:nDMDs
     firstValidTrial = findFirstValidTrial(trialInfo.filename, dmdIdx);
@@ -144,17 +145,6 @@ for dmdIdx = 1:nDMDs
 
     [masks, maskImage, sourceRoiIdx] = getIntegrationMasks(hMDF);
     [refIM, outlines] = loadReferenceImage(dr, dmdIdx, hMDF, masks, params);
-
-    figure;
-    imshow(refIM(:,:,1), []);
-    hold on;
-    for rr = 1:size(masks,3)
-        B = bwboundaries(masks(:,:,rr));
-        for bb = 1:numel(B)
-            plot(B{bb}(:,2), B{bb}(:,1), 'c', 'LineWidth', 1.5);
-        end
-    end
-    title(sprintf('DMD%d masks over refIM inside MATLAB extraction', dmdIdx));
 
     if params.manualROIs
         assert(~isempty(refIM), ['manualROIs=true requires a reference image. ' ...
@@ -195,6 +185,10 @@ summary.nTotalROIs = sum(nAnalysisROIs);
 summary.roiTable = struct2table(roiRecords);
 summary.roiGlobalOffsets = [0, cumsum(nAnalysisROIs(1:end-1))];
 summary.extractionStatus = initializeStatus(summary.roiTable);
+
+% -------------------------------------------------------------------------
+% Initialize output files, then extract traces
+% -------------------------------------------------------------------------
 
 if strcmpi(params.storageMode, 'h5')
     initializeH5Outputs(h5Path, summary, trialInfo, params);
@@ -603,6 +597,12 @@ end
 % -------------------------------------------------------------------------
 
 function [masks, maskImage, sourceRoiIdx] = getIntegrationMasks(hMDF)
+%GETINTEGRATIONMASKS Return DMD integration ROI masks in image coordinates.
+%
+% Prefer a stored ROI mask when present, matching summarize_LoCo.m and other
+% ophys-slap2-analysis preprocessing code. Older SLAP2 metadata sometimes only
+% stores shapeData; in that case reconstruct the mask using the legacy
+% summarize_Voltage/extractDendrites convention.
 meta = hMDF.metaData;
 imagingRois = meta.AcquisitionContainer.ROIs.rois;
 if ~iscell(imagingRois)
@@ -612,11 +612,8 @@ end
 isIntegration = false(1, numel(imagingRois));
 for idx = 1:numel(imagingRois)
     roi = imagingRois{idx};
-    if isstruct(roi) && isfield(roi, 'imagingMode')
-        isIntegration(idx) = strcmpi(char(roi.imagingMode), 'Integrate');
-    elseif isobject(roi) && isprop(roi, 'imagingMode')
-        isIntegration(idx) = strcmpi(char(roi.imagingMode), 'Integrate');
-    end
+    mode = getRoiField(roi, 'imagingMode', '');
+    isIntegration(idx) = strcmpi(char(mode), 'Integrate');
 end
 
 sourceRoiIdx = find(isIntegration);
@@ -630,11 +627,74 @@ maskImage = -1 .* ones(nRows, nCols, 'single');
 
 for roiIdx = 1:nRois
     roi = integrationRois{roiIdx};
-    shape = roi.shapeData;
-    tmp = false(nRows, nCols);
-    tmp(sub2ind(size(tmp), shape(:, 1), shape(:, 2))) = true;
+
+    storedMask = getRoiField(roi, 'mask', []);
+    if ~isempty(storedMask)
+        tmp = normalizeRoiMask(storedMask, nRows, nCols, roiIdx);
+    else
+        shape = getRoiField(roi, 'shapeData', []);
+        if isempty(shape)
+            error('extractDendrites:MissingRoiMask', ...
+                'Integration ROI %d has neither mask nor shapeData.', sourceRoiIdx(roiIdx));
+        end
+        tmp = maskFromShapeData(shape, nRows, nCols, sourceRoiIdx(roiIdx));
+    end
+
     masks(:, :, roiIdx) = tmp;
     maskImage(tmp) = roiIdx;
+end
+end
+
+function tmp = normalizeRoiMask(mask, nRows, nCols, roiIdx)
+%NORMALIZEROIMASK Coerce stored ROI mask to expected DMD image size.
+tmp = logical(mask);
+if ndims(tmp) > 2 && size(tmp, 3) == 1
+    tmp = tmp(:, :, 1);
+end
+if isequal(size(tmp), [nRows, nCols])
+    return
+end
+if isequal(size(tmp), [nCols, nRows])
+    tmp = tmp.';
+    return
+end
+error('extractDendrites:UnexpectedRoiMaskSize', ...
+    'ROI %d stored mask has size %s, expected [%d %d].', ...
+    roiIdx, mat2str(size(tmp)), nRows, nCols);
+end
+
+function tmp = maskFromShapeData(shape, nRows, nCols, sourceRoiIdx)
+%MASKFROMSHAPEDATA Legacy fallback for metadata without stored ROI masks.
+shape = double(shape);
+if size(shape, 2) < 2
+    error('extractDendrites:InvalidShapeData', ...
+        'ROI %d shapeData must have at least two columns.', sourceRoiIdx);
+end
+shape = round(shape(:, 1:2));
+valid = shape(:, 1) >= 1 & shape(:, 1) <= nRows & ...
+        shape(:, 2) >= 1 & shape(:, 2) <= nCols;
+if ~all(valid)
+    warning('extractDendrites:ShapeDataOutOfBounds', ...
+        'ROI %d shapeData contains %d out-of-bounds pixels; ignoring them.', ...
+        sourceRoiIdx, nnz(~valid));
+end
+shape = shape(valid, :);
+tmp = false(nRows, nCols);
+if ~isempty(shape)
+    tmp(sub2ind(size(tmp), shape(:, 1), shape(:, 2))) = true;
+end
+end
+
+function val = getRoiField(roi, fieldName, defaultVal)
+%GETROIFIELD Read a field/property from struct or object ROI metadata.
+if nargin < 3
+    defaultVal = [];
+end
+val = defaultVal;
+if isstruct(roi) && isfield(roi, fieldName)
+    val = roi.(fieldName);
+elseif isobject(roi) && isprop(roi, fieldName)
+    val = roi.(fieldName);
 end
 end
 
@@ -711,13 +771,22 @@ assert(numel(refFn) == 1, ...
 end
 
 function plotDmdPreview(dmdIdx, refIM, maskImage)
+%PLOTDMDPREVIEW Quick QC view of reference image and extracted ROI labels.
 if ~isempty(refIM)
-    figure('Name', sprintf('Reference Image for DMD%d', dmdIdx));
+    figure('Name', sprintf('Reference + masks for DMD%d', dmdIdx));
     imshow(refIM(:, :, 1), []);
+    hold on;
+    B = bwboundaries(maskImage > 0);
+    for idx = 1:numel(B)
+        plot(B{idx}(:, 2), B{idx}(:, 1), 'c', 'LineWidth', 1.0);
+    end
+    title(sprintf('DMD%d reference image with ROI outlines', dmdIdx));
+else
+    figure('Name', sprintf('Masks for DMD%d', dmdIdx));
+    imshow(maskImage, []);
+    colormap('jet');
+    title(sprintf('DMD%d ROI mask labels', dmdIdx));
 end
-figure('Name', sprintf('Masks for DMD%d', dmdIdx));
-imshow(maskImage, []);
-colormap('jet');
 drawnow;
 end
 
