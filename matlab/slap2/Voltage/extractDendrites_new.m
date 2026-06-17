@@ -562,8 +562,8 @@ end
 h5writeatt(h5Path, '/', 'createdAt', char(datetime('now')));
 h5writeatt(h5Path, '/', 'sourceTrialTable', summary.sourceTrialTable);
 h5writeatt(h5Path, '/', 'outputMode', params.outputMode);
-h5writeatt(h5Path, '/', 'writeTrial', summary.outputPlan.writeTrial);
-h5writeatt(h5Path, '/', 'writeContinuous', summary.outputPlan.writeContinuous);
+h5writeatt(h5Path, '/', 'writeTrial', uint8(summary.outputPlan.writeTrial));
+h5writeatt(h5Path, '/', 'writeContinuous', uint8(summary.outputPlan.writeContinuous));
 h5writeatt(h5Path, '/', 'nEpochs', summary.nEpochs);
 h5writeatt(h5Path, '/', 'precision', params.precision);
 end
