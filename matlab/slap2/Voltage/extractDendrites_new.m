@@ -201,8 +201,7 @@ summary.roiTable = struct2table(roiRecords);
 summary.roiGlobalOffsets = [0, cumsum(nAnalysisROIs(1:end-1))];
 summary.extractionStatus = initializeStatus(summary.roiTable);
 
-fprintf('Detected %d imaging epoch(s) from trial-table filenames.
-', summary.nEpochs);
+fprintf('Detected %d imaging epoch(s) from trial-table filenames.', summary.nEpochs);
 if summary.nEpochs > 1
     fprintf('  Epoch trial ranges: ');
     for epIdx = 1:height(summary.epochTable)
