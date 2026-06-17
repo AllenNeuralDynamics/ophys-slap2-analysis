@@ -6,10 +6,8 @@ function summary = extractDendrites_new(dr_or_pathToTrialTable, paramsIn)
 %   This pipeline reads a SLAP2 trial table, discovers DMD integration ROIs,
 %   extracts voltage traces from the SLAP2 Trace backend, and writes large trace
 %   arrays directly to HDF5 while saving lightweight session/ROI metadata to a
-%   MATLAB summary file. It supports continuous CYCLE acquisitions, trial-file
-%   acquisitions, and single-file non-CYCLE acquisitions that should be treated
-%   as continuous recordings, with optional trial-sliced, continuous, or combined
-%   outputs.
+%   MATLAB summary file. It supports continuous CYCLE acquisitions and trial-file
+%   acquisitions, with optional trial-sliced, continuous, or combined outputs.
 %
 %   Important conventions:
 %       - ROI masks are stored in DMD/image pixel coordinates as
@@ -30,12 +28,21 @@ function summary = extractDendrites_new(dr_or_pathToTrialTable, paramsIn)
 %
 %   Outputs:
 %       dendriticVoltageSummary-YYmmDD-HHMMSS.mat
-%           Summary metadata, DMD ROI masks, reference images, trial line ranges,
-%           ROI table, extraction status, and path to paired HDF5 traces.
+%           Summary metadata, DMD ROI masks, reference images, trial/epoch
+%           line ranges, ROI table, extraction status, and path to paired HDF5 traces.
 %
 %       dendriticVoltageTraces-YYmmDD-HHMMSS.h5
 %           /traces/trial_####       [nTrialLines x nTotalROIs]
 %           /traces/continuous/DMD#  [nDmdLines x nLocalROIs]
+%
+%   Epoch handling:
+%       Multi-epoch sessions are detected from acquisition filename prefix changes
+%       (for example acquisition_135515_DMD1 -> acquisition_140535_DMD1).
+%       Epoch metadata are saved in summary.epochTable, summary.trialEpoch,
+%       and summary.trialFilePrefix. For non-CYCLE multi-epoch acquisitions,
+%       this function writes trial-sliced outputs; epoch-continuous HDF5 outputs
+%       are intentionally deferred until downstream alignment can account for
+%       behavior-continuous/imaging-discontinuous timebases.
 
 import ScanImageTiffReader.ScanImageTiffReader
 
@@ -116,6 +123,12 @@ summary.nDMDs = nDMDs;
 summary.nTrials = nTrials;
 summary.trialTable = trialInfo.minimal;
 summary.trialLineRanges = trialInfo.lineRanges;
+summary.trialEpoch = trialInfo.trialEpoch;
+summary.trialFilePrefix = trialInfo.trialFilePrefix;
+summary.epochTable = trialInfo.epochTable;
+summary.nEpochs = trialInfo.nEpochs;
+summary.multiEpochAcquisition = trialInfo.nEpochs > 1;
+summary.outputPlan = planOutputs(params, isContinuousAcq, nTrials);
 summary.masks = cell(1, nDMDs);
 summary.maskImages = cell(1, nDMDs);
 summary.refIM = cell(1, nDMDs);
@@ -188,6 +201,19 @@ summary.roiTable = struct2table(roiRecords);
 summary.roiGlobalOffsets = [0, cumsum(nAnalysisROIs(1:end-1))];
 summary.extractionStatus = initializeStatus(summary.roiTable);
 
+fprintf('Detected %d imaging epoch(s) from trial-table filenames.
+', summary.nEpochs);
+if summary.nEpochs > 1
+    fprintf('  Epoch trial ranges: ');
+    for epIdx = 1:height(summary.epochTable)
+        fprintf('E%d=%d-%d ', summary.epochTable.epochIdx(epIdx), ...
+            summary.epochTable.firstTrial(epIdx), summary.epochTable.lastTrial(epIdx));
+    end
+    fprintf('
+');
+end
+validateOutputPlan(summary.outputPlan, params, isContinuousAcq, nTrials);
+
 % -------------------------------------------------------------------------
 % Initialize output files, then extract traces
 % -------------------------------------------------------------------------
@@ -221,6 +247,47 @@ save(summaryPath, 'summary', '-v7.3');
 fprintf('Extraction complete. Summary saved to:\n  %s\n', summaryPath);
 if strcmpi(params.storageMode, 'h5')
     fprintf('Trace data saved to:\n  %s\n', h5Path);
+end
+end
+
+function outputPlan = planOutputs(params, isContinuousAcq, nTrials)
+%PLANOUTPUTS Decide which HDF5 outputs are valid for this acquisition layout.
+requestedTrial = wantsTrial(params.outputMode);
+requestedContinuous = wantsContinuous(params.outputMode);
+
+% Continuous output is safe for true -CYCLE acquisitions and for the edge case
+% where a single non-CYCLE .dat file spans the whole acquisition. It is not yet
+% safe for multi-trial/multi-epoch non-CYCLE sessions because behavior continues
+% through imaging gaps and should be aligned downstream with explicit epochs.
+canWriteContinuous = isContinuousAcq || nTrials == 1;
+
+outputPlan = struct();
+outputPlan.requestedMode = params.outputMode;
+outputPlan.writeTrial = requestedTrial;
+outputPlan.writeContinuous = requestedContinuous && canWriteContinuous;
+outputPlan.canWriteContinuous = canWriteContinuous;
+outputPlan.isContinuousAcquisition = isContinuousAcq;
+outputPlan.nTrials = nTrials;
+end
+
+function validateOutputPlan(outputPlan, params, isContinuousAcq, nTrials)
+%VALIDATEOUTPUTPLAN Fail early for unsupported output requests.
+if wantsContinuous(params.outputMode) && ~outputPlan.writeContinuous
+    if ~outputPlan.writeTrial
+        error('extractDendrites:UnsupportedContinuousOutput', ...
+            ['params.outputMode="continuous" is not supported for multi-trial ' ...
+             'non-CYCLE acquisitions. Use outputMode="trial" to preserve trial ' ...
+             'datasets plus summary.epochTable/trialEpoch, or outputMode="both" ' ...
+             'if you want trial output while continuous writing is skipped.']);
+    end
+    warning(['Requested continuous output for a multi-trial non-CYCLE acquisition. ' ...
+        'Continuous HDF5 datasets will not be written; trial datasets and epoch ' ...
+        'metadata will be saved instead.']);
+end
+
+if isContinuousAcq && nTrials <= 0
+    error('extractDendrites:InvalidTrialCount', ...
+        'Continuous acquisition was detected, but no trials were found in trialInfo.');
 end
 end
 
@@ -269,10 +336,10 @@ for dmdIdx = 1:nDMDs
             summary.extractionStatus(statusIdx).weightClass = class(batchWeights{j});
             summary.extractionStatus(statusIdx).weightSize = sizeToString(size(batchWeights{j}));
 
-            if wantsContinuous(params.outputMode)
+            if summary.outputPlan.writeContinuous
                 writeContinuousTrace(summary, h5Path, trace, dmdIdx, localRoiIdx, params);
             end
-            if wantsTrial(params.outputMode)
+            if summary.outputPlan.writeTrial
                 writeTrialSlices(summary, trialInfo, h5Path, trace, dmdIdx, globalRoiIdx, params);
             end
 
@@ -295,23 +362,18 @@ end
 end
 
 function summary = extractTrialFiles(summary, trialInfo, dr, params, summaryPath, h5Path)
-%EXTRACTTRIALFILES Extract acquisitions represented as explicit .dat files.
-%
-% Non-CYCLE acquisitions sometimes appear in the trial table as a single
-% trial/file per DMD even though they should be treated as continuous
-% recordings. In that case, outputMode='continuous' writes the full extracted
-% trace into /traces/continuous/DMD#. For multi-trial non-CYCLE acquisitions,
-% continuous concatenation is intentionally not implemented here because epoch
-% boundaries require explicit session-level alignment metadata.
+% Non-CYCLE acquisitions are either true trial-file outputs or a single file
+% accidentally collected without a -CYCLE suffix. For the latter, continuous
+% output is safe because the one .dat file spans the whole imaging epoch. For
+% multi-file/multi-epoch acquisitions, keep trial outputs and preserve epoch
+% metadata rather than stitching discontinuous imaging periods into one trace.
+if wantsContinuous(params.outputMode) && ~summary.outputPlan.writeContinuous
+    warning(['Continuous output for multi-trial non-CYCLE acquisitions is not implemented. ' ...
+        'Writing trial-sliced output only; use summary.epochTable/trialEpoch downstream.']);
+end
 
 nDMDs = summary.nDMDs;
 nTrials = summary.nTrials;
-allowContinuousFromSingleTrial = wantsContinuous(params.outputMode) && nTrials == 1;
-
-if wantsContinuous(params.outputMode) && nTrials > 1
-    warning(['Continuous output for multi-trial non-CYCLE trial-file acquisitions is not implemented. ' ...
-        'Trial-sliced output will be written only when outputMode is ''both'' or ''trial''.']);
-end
 
 for trialIdx = 1:nTrials
     fprintf('\nExtracting trial %d/%d\n', trialIdx, nTrials);
@@ -357,12 +419,10 @@ for trialIdx = 1:nTrials
                 summary.extractionStatus(statusIdx).weightClass = class(batchWeights{j});
                 summary.extractionStatus(statusIdx).weightSize = sizeToString(size(batchWeights{j}));
 
-                if allowContinuousFromSingleTrial
-                    writeContinuousTrace(summary, h5Path, trace, ...
-                        dmdIdx, localRoiIdx, params);
+                if summary.outputPlan.writeContinuous
+                    writeContinuousTrace(summary, h5Path, trace, dmdIdx, localRoiIdx, params);
                 end
-
-                if wantsTrial(params.outputMode)
+                if summary.outputPlan.writeTrial
                     writeOneTrialSlice(summary, trialInfo, h5Path, trace, ...
                         dmdIdx, trialIdx, globalRoiIdx, params);
                 end
@@ -462,7 +522,7 @@ end
 % -------------------------------------------------------------------------
 
 function initializeH5Outputs(h5Path, summary, trialInfo, params)
-if wantsTrial(params.outputMode)
+if summary.outputPlan.writeTrial
     for trialIdx = 1:summary.nTrials
         dset = trialDatasetName(trialIdx);
 
@@ -476,6 +536,8 @@ if wantsTrial(params.outputMode)
             ['Time-aligned trial-sliced traces. Columns are global ROI indices ' ...
              'from summary.roiTable. Rows are relative to trialFirstLineGlobal.']);
         h5writeatt(h5Path, dset, 'trialIdx', trialIdx);
+        h5writeatt(h5Path, dset, 'epochIdx', trialInfo.trialEpoch(trialIdx));
+        h5writeatt(h5Path, dset, 'acquisitionPrefix', trialInfo.trialFilePrefix{trialIdx});
         h5writeatt(h5Path, dset, 'trialFirstLineGlobal', trialInfo.trialFirstLineGlobal(trialIdx));
         h5writeatt(h5Path, dset, 'trialLastLineGlobal', trialInfo.trialLastLineGlobal(trialIdx));
         h5writeatt(h5Path, dset, 'firstLineByDmd', trialInfo.firstLine(:, trialIdx));
@@ -485,7 +547,7 @@ if wantsTrial(params.outputMode)
     end
 end
 
-if wantsContinuous(params.outputMode)
+if summary.outputPlan.writeContinuous
     for dmdIdx = 1:summary.nDMDs
         dset = continuousDatasetName(dmdIdx);
         nRows = summary.dmd(dmdIdx).totalNumLines;
@@ -502,6 +564,9 @@ end
 h5writeatt(h5Path, '/', 'createdAt', char(datetime('now')));
 h5writeatt(h5Path, '/', 'sourceTrialTable', summary.sourceTrialTable);
 h5writeatt(h5Path, '/', 'outputMode', params.outputMode);
+h5writeatt(h5Path, '/', 'writeTrial', summary.outputPlan.writeTrial);
+h5writeatt(h5Path, '/', 'writeContinuous', summary.outputPlan.writeContinuous);
+h5writeatt(h5Path, '/', 'nEpochs', summary.nEpochs);
 h5writeatt(h5Path, '/', 'precision', params.precision);
 end
 
@@ -889,12 +954,16 @@ lineRanges.trialFirstLineGlobal = trialFirstLineGlobal;
 lineRanges.trialLastLineGlobal = trialLastLineGlobal;
 lineRanges.trialGlobalNLines = trialGlobalNLines;
 
+[trialEpoch, trialFilePrefix, epochTable] = inferAcquisitionEpochs(filename, trialTable);
+
 minimal = struct();
 minimal.filename = filename;
 minimal.firstLine = firstLine;
 minimal.lastLine = lastLine;
 minimal.firstLineRounded = firstLineRounded;
 minimal.lastLineRounded = lastLineRounded;
+minimal.trialEpoch = trialEpoch;
+minimal.trialFilePrefix = trialFilePrefix;
 % Preserve scalar/vector trial metadata but intentionally omit large image stacks.
 trialFields = fieldnames(trialTable);
 for tfIdx = 1:numel(trialFields)
@@ -917,7 +986,121 @@ trialInfo.trialFirstLineGlobal = trialFirstLineGlobal;
 trialInfo.trialLastLineGlobal = trialLastLineGlobal;
 trialInfo.trialGlobalNLines = trialGlobalNLines;
 trialInfo.allFilenames = allFilenames(:);
+trialInfo.trialEpoch = trialEpoch;
+trialInfo.trialFilePrefix = trialFilePrefix;
+trialInfo.epochTable = epochTable;
+trialInfo.nEpochs = height(epochTable);
 trialInfo.minimal = minimal;
+end
+
+function [trialEpoch, trialFilePrefix, epochTable] = inferAcquisitionEpochs(filename, trialTable)
+%INFERACQUISITIONEPOCHS Infer imaging epochs from trial-table filenames.
+%
+% buildTrialTableSLAP2 sometimes leaves trialTable.epoch uninformative even when
+% acquisition was paused/restarted. File prefixes are the most reliable local
+% signal: acquisition_135515_DMD1-CYCLE-... and acquisition_135515_DMD2-CYCLE-...
+% belong to the same epoch, while acquisition_140535_* starts a new epoch.
+[~, nTrials] = size(filename);
+trialFilePrefix = repmat({''}, 1, nTrials);
+for trialIdx = 1:nTrials
+    fns = filename(:, trialIdx);
+    fns = fns(~cellfun(@isempty, fns));
+    if isempty(fns)
+        trialFilePrefix{trialIdx} = '';
+    else
+        trialFilePrefix{trialIdx} = acquisitionPrefixFromFilename(fns{1});
+    end
+end
+
+% Use explicit epoch labels only if they are informative. Otherwise derive
+% consecutive epochs from filename-prefix changes.
+explicitEpoch = [];
+try
+    if istable(trialTable) && any(strcmp(trialTable.Properties.VariableNames, 'epoch'))
+        explicitEpoch = double(trialTable.epoch(:))';
+    elseif isstruct(trialTable) && isfield(trialTable, 'epoch')
+        explicitEpoch = double(trialTable.epoch(:))';
+    end
+catch
+    explicitEpoch = [];
+end
+
+if numel(explicitEpoch) == nTrials && numel(unique(explicitEpoch(~isnan(explicitEpoch)))) > 1
+    trialEpoch = relabelEpochVectorStable(explicitEpoch);
+else
+    trialEpoch = ones(1, nTrials);
+    currentEpoch = 1;
+    prevPrefix = trialFilePrefix{1};
+    for trialIdx = 2:nTrials
+        thisPrefix = trialFilePrefix{trialIdx};
+        if ~strcmp(thisPrefix, prevPrefix)
+            currentEpoch = currentEpoch + 1;
+            prevPrefix = thisPrefix;
+        end
+        trialEpoch(trialIdx) = currentEpoch;
+    end
+end
+
+epochIds = unique(trialEpoch, 'stable');
+epochIdxCol = epochIds(:);
+filePrefixCol = cell(numel(epochIds), 1);
+firstTrialCol = zeros(numel(epochIds), 1);
+lastTrialCol = zeros(numel(epochIds), 1);
+nTrialsCol = zeros(numel(epochIds), 1);
+for k = 1:numel(epochIds)
+    ep = epochIds(k);
+    trials = find(trialEpoch == ep);
+    firstTrialCol(k) = trials(1);
+    lastTrialCol(k) = trials(end);
+    nTrialsCol(k) = numel(trials);
+    prefixes = trialFilePrefix(trials);
+    prefixes = prefixes(~cellfun(@isempty, prefixes));
+    if isempty(prefixes)
+        filePrefixCol{k} = '';
+    else
+        filePrefixCol{k} = prefixes{1};
+    end
+end
+
+epochTable = table(epochIdxCol, filePrefixCol, firstTrialCol, lastTrialCol, nTrialsCol, ...
+    'VariableNames', {'epochIdx', 'filePrefix', 'firstTrial', 'lastTrial', 'nTrials'});
+end
+
+function trialEpoch = relabelEpochVectorStable(epochVals)
+%RELABELEPOCHVECTORSTABLE Convert arbitrary epoch labels to 1..N in stable order.
+trialEpoch = nan(size(epochVals));
+seen = [];
+for idx = 1:numel(epochVals)
+    val = epochVals(idx);
+    if isnan(val)
+        if isempty(seen)
+            seen = val;
+            trialEpoch(idx) = 1;
+        else
+            trialEpoch(idx) = numel(seen);
+        end
+        continue
+    end
+    match = find(seen == val, 1, 'first');
+    if isempty(match)
+        seen(end + 1) = val; %#ok<AGROW>
+        match = numel(seen);
+    end
+    trialEpoch(idx) = match;
+end
+trialEpoch(isnan(trialEpoch)) = 1;
+end
+
+function prefix = acquisitionPrefixFromFilename(fn)
+%ACQUISITIONPREFIXFROMFILENAME Strip DMD and CYCLE suffixes to get epoch key.
+[~, name, ~] = fileparts(char(fn));
+prefix = regexprep(name, '_DMD\d+.*$', '');
+prefix = regexprep(prefix, '-DMD\d+.*$', '');
+prefix = regexprep(prefix, '_CYCLE[_-]?\d+.*$', '');
+prefix = regexprep(prefix, '-CYCLE[_-]?\d+.*$', '');
+if isempty(prefix)
+    prefix = name;
+end
 end
 
 function firstValidTrial = findFirstValidTrial(filename, dmdIdx)
