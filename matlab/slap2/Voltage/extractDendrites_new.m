@@ -209,8 +209,7 @@ if summary.nEpochs > 1
         fprintf('E%d=%d-%d ', summary.epochTable.epochIdx(epIdx), ...
             summary.epochTable.firstTrial(epIdx), summary.epochTable.lastTrial(epIdx));
     end
-    fprintf('
-');
+    fprintf('');
 end
 validateOutputPlan(summary.outputPlan, params, isContinuousAcq, nTrials);
 
