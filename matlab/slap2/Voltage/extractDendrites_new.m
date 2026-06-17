@@ -6,8 +6,10 @@ function summary = extractDendrites_new(dr_or_pathToTrialTable, paramsIn)
 %   This pipeline reads a SLAP2 trial table, discovers DMD integration ROIs,
 %   extracts voltage traces from the SLAP2 Trace backend, and writes large trace
 %   arrays directly to HDF5 while saving lightweight session/ROI metadata to a
-%   MATLAB summary file. It supports continuous CYCLE acquisitions and trial-file
-%   acquisitions, with optional trial-sliced, continuous, or combined outputs.
+%   MATLAB summary file. It supports continuous CYCLE acquisitions, trial-file
+%   acquisitions, and single-file non-CYCLE acquisitions that should be treated
+%   as continuous recordings, with optional trial-sliced, continuous, or combined
+%   outputs.
 %
 %   Important conventions:
 %       - ROI masks are stored in DMD/image pixel coordinates as
@@ -293,13 +295,23 @@ end
 end
 
 function summary = extractTrialFiles(summary, trialInfo, dr, params, summaryPath, h5Path)
-if wantsContinuous(params.outputMode)
-    warning(['Continuous output for non-CYCLE trial-file acquisitions is not implemented. ' ...
-        'Only trial-sliced output will be written.']);
-end
+%EXTRACTTRIALFILES Extract acquisitions represented as explicit .dat files.
+%
+% Non-CYCLE acquisitions sometimes appear in the trial table as a single
+% trial/file per DMD even though they should be treated as continuous
+% recordings. In that case, outputMode='continuous' writes the full extracted
+% trace into /traces/continuous/DMD#. For multi-trial non-CYCLE acquisitions,
+% continuous concatenation is intentionally not implemented here because epoch
+% boundaries require explicit session-level alignment metadata.
 
 nDMDs = summary.nDMDs;
 nTrials = summary.nTrials;
+allowContinuousFromSingleTrial = wantsContinuous(params.outputMode) && nTrials == 1;
+
+if wantsContinuous(params.outputMode) && nTrials > 1
+    warning(['Continuous output for multi-trial non-CYCLE trial-file acquisitions is not implemented. ' ...
+        'Trial-sliced output will be written only when outputMode is ''both'' or ''trial''.']);
+end
 
 for trialIdx = 1:nTrials
     fprintf('\nExtracting trial %d/%d\n', trialIdx, nTrials);
@@ -345,8 +357,15 @@ for trialIdx = 1:nTrials
                 summary.extractionStatus(statusIdx).weightClass = class(batchWeights{j});
                 summary.extractionStatus(statusIdx).weightSize = sizeToString(size(batchWeights{j}));
 
-                writeOneTrialSlice(summary, trialInfo, h5Path, trace, ...
-                    dmdIdx, trialIdx, globalRoiIdx, params);
+                if allowContinuousFromSingleTrial
+                    writeContinuousTrace(summary, h5Path, trace, ...
+                        dmdIdx, localRoiIdx, params);
+                end
+
+                if wantsTrial(params.outputMode)
+                    writeOneTrialSlice(summary, trialInfo, h5Path, trace, ...
+                        dmdIdx, trialIdx, globalRoiIdx, params);
+                end
 
                 summary.extractionStatus(statusIdx).status = 'in_progress';
                 summary.extractionStatus(statusIdx).finishedAt = char(datetime('now'));
