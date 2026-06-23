@@ -87,13 +87,11 @@ switch fnName
         params.frameRate = 0; tooltips.frameRate = 'imaging frame rate; if 0, calculated from metadata or set as default';
         params.denoise20Hz = false;
         params.saveTif = true; tooltips.saveTif = 'whether to save registered movie as .tif or .h5';
-    case 'extractDendrites'
-        params.manualROIs = false;  tooltips.manualROIs = 'Draw ROIs manually? If false, use SLAP2 ROIs';
-        params.chIdx = 1;           tooltips.chIdx = 'Which channel to analyze?';
-        params.windowWidth_lines = 16; tooltips.windowWidth_lines = 'exponential time averaging constant for signal extraction. bandwidth is 11kHz/windowWidth_lines';
-        params.expectedWindowWidth_lines = 5000; tooltips.expectedWindowWidth_lines = 'exponential time averaging constant for baseline calculation';
-    case 'extractDendrites_new'
-        params.manualROIs = false; 
+    case {'extractDendrites', 'extractDendrites_new'}
+        % Epoch-aware SLAP2 dendritic-voltage extraction. extractDendrites_new
+        % remains accepted for backward compatibility, but extractDendrites is
+        % now the canonical function name.
+        params.manualROIs = false;
         tooltips.manualROIs = 'Draw ROIs manually? If false, use SLAP2 integration ROIs.';
 
         params.chIdx = 1;
@@ -109,7 +107,7 @@ switch fnName
         tooltips.expectedWindowWidth_lines = 'Expected/baseline window width, in SLAP2 lines, passed to Trace.process. Matches the original extractDendrites default.';
 
         params.outputMode = 'trial';
-        tooltips.outputMode = 'Trace organization: trial, continuous, or both. Trial is recommended for downstream voltage analysis.';
+        tooltips.outputMode = 'Trace organization: trial, continuous, or both. Trial is recommended for multi-trial and multi-epoch voltage analysis.';
 
         params.storageMode = 'h5';
         tooltips.storageMode = 'Storage backend for large trace arrays. h5 is recommended for large recordings.';
