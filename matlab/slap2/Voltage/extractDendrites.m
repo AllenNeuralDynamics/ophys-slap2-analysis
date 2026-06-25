@@ -63,6 +63,9 @@ else
     params = initializeParams(paramsIn);
 end
 
+fprintf('Resolved extractDendrites params: outputMode=%s, storageMode=%s, precision=%s\n', ...
+    params.outputMode, params.storageMode, params.precision);
+
 timestamp = datestr(now, 'YYmmDD-HHMMSS');
 
 if isempty(params.outputDir)
@@ -233,11 +236,7 @@ params = configureParallelPool(params);
 summary.params = params;
 save(summaryPath, 'summary', '-v7.3');
 
-if isContinuousAcq
-    summary = extractContinuousAcquisition(summary, trialInfo, dr, params, summaryPath, h5Path);
-else
-    summary = extractTrialFiles(summary, trialInfo, dr, params, summaryPath, h5Path);
-end
+summary = executeOutputPlan(summary, trialInfo, dr, params, summaryPath, h5Path);
 
 summary.completedAt = char(datetime('now'));
 summary.complete = true;
@@ -292,6 +291,55 @@ end
 % -------------------------------------------------------------------------
 % Main extraction branches
 % -------------------------------------------------------------------------
+
+function summary = executeOutputPlan(summary, trialInfo, dr, params, summaryPath, h5Path)
+%EXECUTEOUTPUTPLAN Route extraction from the requested output plan.
+%
+% Acquisition layout and storage layout are intentionally separated:
+%   - summary.isContinuousAcquisition describes the raw SLAP2 files.
+%   - summary.outputPlan.writeTrial/writeContinuous describe requested outputs.
+%
+% For CYCLE-style continuous acquisitions, trial-sliced output still requires
+% extracting each ROI trace from the continuous source file and then slicing by
+% trial line ranges. This is an extraction source path, not a request to write
+% /traces/continuous datasets unless writeContinuous is true.
+if ~summary.outputPlan.writeTrial && ~summary.outputPlan.writeContinuous
+    error('extractDendrites:NoOutputsRequested', ...
+        'Output plan requested neither trial nor continuous HDF5 output.');
+end
+
+fprintf('Output plan: requestedMode=%s, writeTrial=%d, writeContinuous=%d, canWriteContinuous=%d\n', ...
+    summary.outputPlan.requestedMode, summary.outputPlan.writeTrial, ...
+    summary.outputPlan.writeContinuous, summary.outputPlan.canWriteContinuous);
+
+if summary.isContinuousAcquisition
+    if summary.outputPlan.writeContinuous && summary.outputPlan.writeTrial
+        fprintf(['Using continuous-source extraction path; writing BOTH continuous ' ...
+            'datasets and trial-sliced datasets.\n']);
+    elseif summary.outputPlan.writeContinuous
+        fprintf(['Using continuous-source extraction path; writing continuous ' ...
+            'datasets only.\n']);
+    elseif summary.outputPlan.writeTrial
+        fprintf(['Using continuous-source extraction path; writing trial-sliced ' ...
+            'datasets only. No /traces/continuous datasets will be written.\n']);
+    end
+    summary = extractContinuousAcquisition(summary, trialInfo, dr, params, summaryPath, h5Path);
+    return
+end
+
+% Non-CYCLE data are extracted trial-by-trial. The single-file non-CYCLE edge
+% case may still request continuous output; extractTrialFiles handles that by
+% writing the one full trace into /traces/continuous/DMD# when permitted.
+if summary.outputPlan.writeContinuous && ~summary.outputPlan.writeTrial && summary.nTrials > 1
+    error('extractDendrites:UnsupportedContinuousOutput', ...
+        ['Continuous-only output is not supported for multi-trial non-CYCLE ' ...
+         'acquisitions. Use outputMode="trial" to preserve epoch-aware trial data.']);
+end
+
+fprintf('Using trial-file extraction path; writeTrial=%d, writeContinuous=%d.\n', ...
+    summary.outputPlan.writeTrial, summary.outputPlan.writeContinuous);
+summary = extractTrialFiles(summary, trialInfo, dr, params, summaryPath, h5Path);
+end
 
 function summary = extractContinuousAcquisition(summary, trialInfo, dr, params, summaryPath, h5Path)
 nDMDs = summary.nDMDs;
@@ -1216,56 +1264,44 @@ end
 % -------------------------------------------------------------------------
 
 function params = initializeParams(paramsIn)
-%INITIALIZEPARAMS Resolve defaults, GUI selections, and explicit overrides.
-%
-% The previous implementation silently fell back to defaultParams() when
-% setParams/optionsGUI raised an error. Because defaultParams().outputMode is
-% 'trial', a GUI or path problem could make a user-selected 'continuous' run
-% look as though extraction ignored the requested output mode. This version
-% fails loudly on GUI errors, accepts saved optsOut .mat files directly, unwraps
-% optsOut structs, and prints the resolved output mode before extraction starts.
-
 params = defaultParams();
 
 if nargin < 1
     paramsIn = [];
 end
 
-paramsIn = loadOrDecodeParams(paramsIn);
-
-if exist('setParams', 'file') == 2
-    if isempty(paramsIn)
-        % No explicit parameters: open the GUI and use exactly what it returns.
+if isempty(paramsIn)
+    % Interactive path: setParams/optionsGUI should return the final values.
+    % Do not silently fall back to defaults because outputMode defaults to
+    % 'trial' and can mask GUI failures.
+    if exist('setParams', 'file') == 2
         guiParams = setParams('extractDendrites');
+        params = mergeStructs(params, guiParams);
     else
-        % Explicit parameters: merge with setParams defaults without opening GUI.
-        guiParams = setParams('extractDendrites', paramsIn, false);
+        warning('extractDendrites:setParamsMissing', ...
+            'setParams.m not found; using built-in defaults.');
     end
-    guiParams = normalizeParamsStruct(guiParams);
-    params = mergeStructs(params, guiParams);
 else
-    warning('extractDendrites:MissingSetParams', ...
-        'setParams.m not found on path; using extractDendrites internal defaults plus explicit paramsIn.');
-end
-
-if ~isempty(paramsIn)
-    paramsIn = normalizeParamsStruct(paramsIn);
+    % Programmatic path: respect the user-supplied params exactly, whether the
+    % input is a struct, a saved .mat file containing optsOut/params, or a JSON
+    % string. Avoid routing through optionsGUI here because GUI/default merging
+    % can overwrite explicitly supplied values on some installations.
+    paramsIn = normalizeParamsInput(paramsIn);
     params = mergeStructs(params, paramsIn);
 end
 
-params = normalizeParamsStruct(params);
-
-% Accept a common plural typo from early test versions.
-if isfield(params, 'outputMode') && strcmpi(params.outputMode, 'trials')
-    params.outputMode = 'trial';
+% Accept common aliases from early test versions and notebooks.
+if isfield(params, 'outputMode')
+    if strcmpi(params.outputMode, 'trials')
+        params.outputMode = 'trial';
+    elseif strcmpi(params.outputMode, 'continuous_only')
+        params.outputMode = 'continuous';
+    end
 end
 
 params.outputMode = validatestring(params.outputMode, {'trial', 'continuous', 'both'});
 params.storageMode = validatestring(params.storageMode, {'h5', 'memory'});
 params.precision = validatestring(params.precision, {'single', 'double'});
-
-fprintf('Resolved extractDendrites params: outputMode=%s, storageMode=%s, precision=%s\n', ...
-    params.outputMode, params.storageMode, params.precision);
 if ~(ischar(params.outputSubfolderName) || isstring(params.outputSubfolderName))
     error('extractDendrites:InvalidParams', ...
         'params.outputSubfolderName must be a char vector or string scalar.');
@@ -1277,90 +1313,48 @@ params.h5ChunkLines = max(1, round(params.h5ChunkLines));
 params.h5Deflate = max(0, min(9, round(params.h5Deflate)));
 end
 
-function params = loadOrDecodeParams(paramsIn)
-%LOADORDECODEPARAMS Accept structs, JSON strings, and saved options .mat files.
-if isempty(paramsIn)
-    params = [];
+function paramsIn = normalizeParamsInput(paramsIn)
+%NORMALIZEPARAMSINPUT Convert supported parameter inputs to a struct.
+if isstruct(paramsIn)
     return
 end
 
-if isstring(paramsIn) && isscalar(paramsIn)
-    paramsIn = char(paramsIn);
-end
-
-if ischar(paramsIn)
-    txt = strtrim(paramsIn);
+if ischar(paramsIn) || isstring(paramsIn)
+    txt = char(paramsIn);
     if exist(txt, 'file') == 2
-        S = load(txt);
-        if isfield(S, 'optsOut')
-            params = S.optsOut;
-        elseif isfield(S, 'params')
-            params = S.params;
-        else
-            f = fieldnames(S);
-            if numel(f) == 1 && isstruct(S.(f{1}))
-                params = S.(f{1});
-            else
-                error('extractDendrites:InvalidParamsFile', ...
-                    'Parameter file %s must contain optsOut, params, or one struct variable.', txt);
-            end
+        [~, ~, ext] = fileparts(txt);
+        switch lower(ext)
+            case '.mat'
+                S = load(txt);
+                if isfield(S, 'optsOut')
+                    paramsIn = S.optsOut;
+                elseif isfield(S, 'params')
+                    paramsIn = S.params;
+                elseif isfield(S, 'opts')
+                    paramsIn = S.opts;
+                else
+                    names = fieldnames(S);
+                    if numel(names) == 1 && isstruct(S.(names{1}))
+                        paramsIn = S.(names{1});
+                    else
+                        error('extractDendrites:InvalidParamsFile', ...
+                            'MAT parameter file must contain optsOut, params, opts, or one struct variable.');
+                    end
+                end
+            otherwise
+                paramsIn = jsondecode(txt);
         end
-    elseif startsWith(txt, '{')
-        params = jsondecode(txt);
     else
-        error('extractDendrites:InvalidParamsInput', ...
-            'Character paramsIn must be a .mat path or JSON struct string. Got: %s', txt);
+        paramsIn = jsondecode(txt);
     end
 else
-    params = paramsIn;
+    error('extractDendrites:InvalidParams', ...
+        'paramsIn must be a struct, MAT-file path, or JSON string.');
 end
 
-if isstruct(params) && isfield(params, 'optsOut')
-    params = params.optsOut;
-end
-end
-
-function params = normalizeParamsStruct(params)
-%NORMALIZEPARAMSSTRUCT Convert GUI option-list values to scalar values.
-if isempty(params)
-    return
-end
-if ~isstruct(params)
-    error('extractDendrites:InvalidParams', 'Parameters must be a struct, optsOut file, or JSON struct.');
-end
-
-if isfield(params, 'outputMode')
-    params.outputMode = normalizeChoiceValue(params.outputMode);
-end
-if isfield(params, 'storageMode')
-    params.storageMode = normalizeChoiceValue(params.storageMode);
-end
-if isfield(params, 'precision')
-    params.precision = normalizeChoiceValue(params.precision);
-end
-end
-
-function val = normalizeChoiceValue(val)
-%NORMALIZECHOICEVALUE Convert optionsGUI cell choices into selected strings.
-% For example, {'''trial''', '''continuous'''} becomes 'trial'. Explicit
-% char/string values are otherwise preserved.
-if iscell(val)
-    if isempty(val)
-        val = '';
-    else
-        val = val{1};
-    end
-end
-if isstring(val)
-    val = char(val);
-end
-if ischar(val)
-    val = strtrim(val);
-    if numel(val) >= 2
-        if (val(1) == '''' && val(end) == '''') || (val(1) == '"' && val(end) == '"')
-            val = val(2:end-1);
-        end
-    end
+if ~isstruct(paramsIn)
+    error('extractDendrites:InvalidParams', ...
+        'Resolved paramsIn is not a struct.');
 end
 end
 
