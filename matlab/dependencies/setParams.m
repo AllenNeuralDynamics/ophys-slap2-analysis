@@ -106,7 +106,7 @@ switch fnName
         params.expectedWindowWidth_lines = 5000;
         tooltips.expectedWindowWidth_lines = 'Expected/baseline window width, in SLAP2 lines, passed to Trace.process. Matches the original extractDendrites default.';
 
-        params.outputMode = 'trial';
+        params.outputMode = {'''trial''', '''continuous''', '''both'''};
         tooltips.outputMode = 'Trace organization: trial, continuous, or both. Trial is recommended for multi-trial and multi-epoch voltage analysis.';
 
         params.storageMode = 'h5';

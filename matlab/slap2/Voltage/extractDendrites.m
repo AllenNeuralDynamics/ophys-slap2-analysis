@@ -1216,36 +1216,44 @@ end
 % -------------------------------------------------------------------------
 
 function params = initializeParams(paramsIn)
+%INITIALIZEPARAMS Resolve defaults, GUI selections, and explicit overrides.
+%
+% The previous implementation silently fell back to defaultParams() when
+% setParams/optionsGUI raised an error. Because defaultParams().outputMode is
+% 'trial', a GUI or path problem could make a user-selected 'continuous' run
+% look as though extraction ignored the requested output mode. This version
+% fails loudly on GUI errors, accepts saved optsOut .mat files directly, unwraps
+% optsOut structs, and prints the resolved output mode before extraction starts.
+
 params = defaultParams();
 
 if nargin < 1
     paramsIn = [];
 end
 
-if ischar(paramsIn) || isstring(paramsIn)
-    paramsIn = jsondecode(char(paramsIn));
-end
+paramsIn = loadOrDecodeParams(paramsIn);
 
-% Pull defaults from the local pipeline GUI using the extractDendrites
-% case. If paramsIn is empty, setParams opens the GUI. If paramsIn is
-% provided, setParams merges those values with GUI defaults and returns
-% without opening the GUI.
-try
-    if exist('setParams', 'file') == 2
-        if isempty(paramsIn)
-            guiParams = setParams('extractDendrites');
-        else
-            guiParams = setParams('extractDendrites', paramsIn, false);
-        end
-        params = mergeStructs(params, guiParams);
+if exist('setParams', 'file') == 2
+    if isempty(paramsIn)
+        % No explicit parameters: open the GUI and use exactly what it returns.
+        guiParams = setParams('extractDendrites');
+    else
+        % Explicit parameters: merge with setParams defaults without opening GUI.
+        guiParams = setParams('extractDendrites', paramsIn, false);
     end
-catch ME
-    warning('Ignoring setParams(''extractDendrites'') defaults: %s', ME.message);
+    guiParams = normalizeParamsStruct(guiParams);
+    params = mergeStructs(params, guiParams);
+else
+    warning('extractDendrites:MissingSetParams', ...
+        'setParams.m not found on path; using extractDendrites internal defaults plus explicit paramsIn.');
 end
 
 if ~isempty(paramsIn)
+    paramsIn = normalizeParamsStruct(paramsIn);
     params = mergeStructs(params, paramsIn);
 end
+
+params = normalizeParamsStruct(params);
 
 % Accept a common plural typo from early test versions.
 if isfield(params, 'outputMode') && strcmpi(params.outputMode, 'trials')
@@ -1255,6 +1263,9 @@ end
 params.outputMode = validatestring(params.outputMode, {'trial', 'continuous', 'both'});
 params.storageMode = validatestring(params.storageMode, {'h5', 'memory'});
 params.precision = validatestring(params.precision, {'single', 'double'});
+
+fprintf('Resolved extractDendrites params: outputMode=%s, storageMode=%s, precision=%s\n', ...
+    params.outputMode, params.storageMode, params.precision);
 if ~(ischar(params.outputSubfolderName) || isstring(params.outputSubfolderName))
     error('extractDendrites:InvalidParams', ...
         'params.outputSubfolderName must be a char vector or string scalar.');
@@ -1264,6 +1275,93 @@ params.maxConcurrentROIs = max(1, round(params.maxConcurrentROIs));
 params.numWorkers = max(1, round(params.numWorkers));
 params.h5ChunkLines = max(1, round(params.h5ChunkLines));
 params.h5Deflate = max(0, min(9, round(params.h5Deflate)));
+end
+
+function params = loadOrDecodeParams(paramsIn)
+%LOADORDECODEPARAMS Accept structs, JSON strings, and saved options .mat files.
+if isempty(paramsIn)
+    params = [];
+    return
+end
+
+if isstring(paramsIn) && isscalar(paramsIn)
+    paramsIn = char(paramsIn);
+end
+
+if ischar(paramsIn)
+    txt = strtrim(paramsIn);
+    if exist(txt, 'file') == 2
+        S = load(txt);
+        if isfield(S, 'optsOut')
+            params = S.optsOut;
+        elseif isfield(S, 'params')
+            params = S.params;
+        else
+            f = fieldnames(S);
+            if numel(f) == 1 && isstruct(S.(f{1}))
+                params = S.(f{1});
+            else
+                error('extractDendrites:InvalidParamsFile', ...
+                    'Parameter file %s must contain optsOut, params, or one struct variable.', txt);
+            end
+        end
+    elseif startsWith(txt, '{')
+        params = jsondecode(txt);
+    else
+        error('extractDendrites:InvalidParamsInput', ...
+            'Character paramsIn must be a .mat path or JSON struct string. Got: %s', txt);
+    end
+else
+    params = paramsIn;
+end
+
+if isstruct(params) && isfield(params, 'optsOut')
+    params = params.optsOut;
+end
+end
+
+function params = normalizeParamsStruct(params)
+%NORMALIZEPARAMSSTRUCT Convert GUI option-list values to scalar values.
+if isempty(params)
+    return
+end
+if ~isstruct(params)
+    error('extractDendrites:InvalidParams', 'Parameters must be a struct, optsOut file, or JSON struct.');
+end
+
+if isfield(params, 'outputMode')
+    params.outputMode = normalizeChoiceValue(params.outputMode);
+end
+if isfield(params, 'storageMode')
+    params.storageMode = normalizeChoiceValue(params.storageMode);
+end
+if isfield(params, 'precision')
+    params.precision = normalizeChoiceValue(params.precision);
+end
+end
+
+function val = normalizeChoiceValue(val)
+%NORMALIZECHOICEVALUE Convert optionsGUI cell choices into selected strings.
+% For example, {'''trial''', '''continuous'''} becomes 'trial'. Explicit
+% char/string values are otherwise preserved.
+if iscell(val)
+    if isempty(val)
+        val = '';
+    else
+        val = val{1};
+    end
+end
+if isstring(val)
+    val = char(val);
+end
+if ischar(val)
+    val = strtrim(val);
+    if numel(val) >= 2
+        if (val(1) == '''' && val(end) == '''') || (val(1) == '"' && val(end) == '"')
+            val = val(2:end-1);
+        end
+    end
+end
 end
 
 function params = defaultParams()
