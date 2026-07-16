@@ -10,7 +10,7 @@ import time
 import multiprocessing as mp
 from functools import partial
 import tkinter as tk
-from tkinter import filedialog, ttk, messagebox
+from tkinter import filedialog, ttk, messagebox, simpledialog
 from datetime import datetime, timezone
 import importlib
 import skimage.io as skimio
@@ -26,7 +26,6 @@ from scipy.sparse.linalg import svds
 
 sys.path.append('C:/Users/michael.xie/Documents/ophys-slap2-analysis/python')
 # sys.path.append(str(Path(__file__).parent.parent))
-import reconstruct
 
 import cv2
 
@@ -36,8 +35,6 @@ from aind_data_schema.core.processing import (
     Processing,
     ProcessName,
     ProcessStage,
-    ResourceTimestamped,
-    ResourceUsage,
 )
 from aind_data_schema_models.units import MemoryUnit
 from aind_data_schema_models.system_architecture import OperatingSystem, CPUArchitecture
@@ -53,6 +50,118 @@ def to_serializable(val):
     if isinstance(val, np.generic):
         return val.item()
     return val
+
+
+# ---------------------------------------------------------------------------
+# GIAnT-MATLAB HDF5 readers
+#
+# BandRegistration.m (GIAnT-MATLAB) writes its outputs as HDF5 via
+# saveStructToH5.m rather than the old .mat files. The functions below mirror
+# loadStructFromH5.m: groups become nested dicts, string datasets become str
+# (or object arrays), and numeric datasets are returned in MATLAB size()
+# orientation. MATLAB writes column-major (the /row_major flag is 0, or absent),
+# so h5py reads datasets with axes reversed and we transpose to recover layout.
+# ---------------------------------------------------------------------------
+
+def _h5_is_string_dataset(ds):
+    if h5py.check_string_dtype(ds.dtype) is not None:
+        return True
+    return ds.dtype.kind in ('S', 'U', 'O')
+
+
+def _decode_h5_strings(val):
+    """Decode bytes -> str for a scalar or ndarray of (variable-length) strings."""
+    def _dec(x):
+        if isinstance(x, (bytes, np.bytes_)):
+            return x.decode('utf-8', 'replace')
+        return str(x)
+
+    if isinstance(val, (bytes, str, np.bytes_, np.str_)):
+        return _dec(val)
+    arr = np.asarray(val, dtype=object)
+    if arr.size == 0:
+        return arr
+    return np.vectorize(_dec, otypes=[object])(arr)
+
+
+def _read_h5_dataset(ds, row_major):
+    """Read one dataset written by saveStructToH5.m, in MATLAB size() orientation.
+
+    Scalar strings/paths (e.g. datadr, savedr) are returned as plain ``str``;
+    string grids (e.g. filename, fn_adata) stay as object arrays with MATLAB shape.
+    """
+    val = ds[()]
+    if _h5_is_string_dataset(ds):
+        val = _decode_h5_strings(val)
+        if isinstance(val, np.ndarray):
+            if (not row_major) and val.ndim >= 2:
+                val = val.T
+            if val.size == 1:
+                return val.reshape(-1)[0]
+        return val
+    val = np.asarray(val)
+    if (not row_major) and val.ndim >= 2:
+        val = val.T
+    return val
+
+
+def _read_h5_group(grp, row_major):
+    out = {}
+    for key, item in grp.items():
+        if key == 'row_major':
+            continue
+        if isinstance(item, h5py.Group):
+            out[key] = _read_h5_group(item, row_major)
+        else:
+            out[key] = _read_h5_dataset(item, row_major)
+    return out
+
+
+def load_struct_from_h5(path):
+    """Python port of GIAnT-MATLAB loadStructFromH5.m.
+
+    Reads a (possibly nested) MATLAB struct from HDF5 into a nested dict, honoring
+    the ``/row_major`` layout flag (absent => column-major, so axes are transposed
+    to recover MATLAB/README orientation).
+    """
+    with h5py.File(path, 'r') as f:
+        row_major = False
+        if 'row_major' in f:
+            row_major = bool(np.asarray(f['row_major'][()]).reshape(-1)[0])
+        return _read_h5_group(f, row_major)
+
+
+def _ref_stack_group(ref_stack, DMDix):
+    """ref_stack subgroups may be named Path{N} (current) or DMD{N} (legacy)."""
+    return ref_stack.get(f'Path{DMDix+1}', ref_stack.get(f'DMD{DMDix+1}'))
+
+
+def load_alignment_data_h5(path):
+    """Load a ``*_ALIGNMENTDATA.h5`` file (aData) into a dict of 1-D arrays / scalars.
+
+    Mirrors the aData struct written by BandRegistration.m. The motion
+    estimates are stored as column vectors and online-motion shifts live under the
+    nested ``slap2`` group in the new format; everything is flattened to 1-D here.
+    """
+    s = load_struct_from_h5(path)
+    slap2 = s.get('slap2', {}) or {}
+
+    def _1d(src, key):
+        v = src.get(key)
+        return None if v is None else np.asarray(v).reshape(-1)
+
+    return {
+        'DSframes': _1d(s, 'DSframes'),
+        'motionDSr': _1d(s, 'motionDSr'),
+        'motionDSc': _1d(s, 'motionDSc'),
+        'motionDSz': _1d(s, 'motionDSz'),
+        'onlineYshift': _1d(slap2, 'onlineMotionYshift'),
+        'onlineXshift': _1d(slap2, 'onlineMotionXshift'),
+        'onlineZshift': _1d(slap2, 'onlineMotionZshift'),
+        'numChannels': int(np.asarray(s['numChannels']).reshape(-1)[0]),
+        'alignHz': float(np.asarray(s['alignHz']).reshape(-1)[0]),
+    }
+
 
 def nearest_interp(x, xp, yp):
     if len(xp) == 1:
@@ -234,8 +343,9 @@ def _gaussian_peaks_integrated(theta, yxdata):
         _erf((yB - my[np.newaxis, :]) / (rt2 * s[np.newaxis, :]))
     )  # (Hg, N)
 
-    img = (Iy * A[np.newaxis, :]) @ Ix.T   # (Hg, Wg)
-    return img[y_idx, x_idx]
+    # Evaluate only at the M selected pixels instead of building the full
+    # (Hg, Wg) grid and discarding most of it: val_m = sum_n A_n Iy[y,n] Ix[x,n]
+    return (Iy[y_idx, :] * Ix[x_idx, :]) @ A
 
 
 def _gaussian_peaks_integrated_val_jac(theta, yxdata):
@@ -282,16 +392,15 @@ def _gaussian_peaks_integrated_val_jac(theta, yxdata):
     erf_uy_T = _erf(uy_T)
     Iy = c * s[np.newaxis, :] * (erf_uy_T - erf_uy_B)  # (Hg, N)
 
-    # --- forward value ---
-    img = (Iy * A[np.newaxis, :]) @ Ix.T              # (Hg, Wg)
-    val = img[y_idx, x_idx]                            # (M,)
-
-    # --- Jacobian (M, 4*N) ---
+    # --- sample profiles at the M selected pixels (shared by value & Jacobian) ---
     Iy_m = Iy[y_idx, :]                               # (M, N)
     Ix_m = Ix[x_idx, :]                               # (M, N)
 
     # d/dA_n
     dval_dA = Iy_m * Ix_m                              # (M, N)
+
+    # --- forward value: sum_n A_n Iy[y,n] Ix[x,n] (no full (Hg, Wg) grid) ---
+    val = dval_dA @ A                                  # (M,)
 
     # d(Iy)/d(my):  exp(-uy_B^2) - exp(-uy_T^2)   (simplification where c*2/(rt2*sqrt(pi)) = 1)
     exp_uyB2 = np.exp(-uy_B ** 2)                      # (Hg, N)
@@ -383,8 +492,12 @@ def _lsq_curvefit(theta0, xdata, ydata, lb_flat, ub_flat, max_nfev=5000):
     return x.reshape(-1, 4)
 
 
-def _detect_peaks_2d(act_im_2d, exclusion_mask, mu_bg, sigma_bg, peak_thresh, peak_th):
+def _detect_peaks_2d(act_im_2d, exclusion_mask, mu_bg, sigma_bg, peak_thresh, peak_th,
+                     buffer_size=0):
     """Per-plane peak detection with externally supplied background stats.
+
+    buffer_size : int, if > 0 the peak (buffer) mask is dilated by a
+        buffer_size x buffer_size square (matches MATLAB imdilate(pIM,ones(bufferSize))).
 
     Returns (N, 4) array [amplitude, mu_y, mu_x, sigma], or (0, 4) if none.
     """
@@ -410,6 +523,13 @@ def _detect_peaks_2d(act_im_2d, exclusion_mask, mu_bg, sigma_bg, peak_thresh, pe
             iy = np.clip(np.round(tf[:, 1]).astype(int), 0, H - 1)
             ix = np.clip(np.round(tf[:, 2]).astype(int), 0, W - 1)
             pIM[iy, ix] = True
+        return pIM
+
+    def _buffer_mask(pIM):
+        # MATLAB: bufferSize>0 -> imdilate(pIM,ones(bufferSize)), else pIM
+        if buffer_size > 0:
+            return ndimage.binary_dilation(
+                pIM, structure=np.ones((buffer_size, buffer_size)))
         return pIM
 
     # --- Initial peak detection ---
@@ -442,7 +562,8 @@ def _detect_peaks_2d(act_im_2d, exclusion_mask, mu_bg, sigma_bg, peak_thresh, pe
     thetaf = _lsq_curvefit(thetaf, sel_yx, sel_vals, lb_f, ub_f, max_nfev=5000)
 
     # --- Build fit image & residual ---
-    buffer_mask = _peak_mask(thetaf)
+    p_im = _peak_mask(thetaf)
+    buffer_mask = _buffer_mask(p_im)
 
     fit_im = np.zeros((H, W), dtype=float)
     fit_im[act_sel_pix] = _gaussian_peaks_integrated(thetaf, sel_yx)
@@ -512,14 +633,15 @@ def _detect_peaks_2d(act_im_2d, exclusion_mask, mu_bg, sigma_bg, peak_thresh, pe
             modified_ccs.append((cc_mask, cc_yx))
 
         # Global update once per round (not once per peak)
-        buffer_mask = _peak_mask(thetaf)
+        p_im = _peak_mask(thetaf)
+        buffer_mask = _buffer_mask(p_im)
         for cc_mask, cc_yx in modified_ccs:
             fit_im[cc_mask] = _gaussian_peaks_integrated(thetaf, cc_yx)
         res_im = (act_im_2d - fit_im - mu_bg) / sigma_bg
         fit_support = fit_im > 1e-3
 
-        # Rebuild support from current peak positions
-        act_sel_pix = ndimage.binary_dilation(buffer_mask, structure=np.ones((9, 9)))
+        # Rebuild support from current peak positions (MATLAB uses raw pIM)
+        act_sel_pix = ndimage.binary_dilation(p_im, structure=np.ones((9, 9)))
         act_sel_pix &= ~np.isnan(act_im_2d)
         labeled_full, _ = ndimage.label(act_sel_pix)
 
@@ -532,7 +654,7 @@ def _detect_peaks_2d(act_im_2d, exclusion_mask, mu_bg, sigma_bg, peak_thresh, pe
     return thetaf
 
 
-def get_act_im_peaks(act_im, peak_th=3.0, exclusion_mask=None):
+def get_act_im_peaks(act_im, peak_th=3.0, exclusion_mask=None, buffer_size=0):
     """Find Gaussian peaks in a 3D (Z, H, W) activity image.
 
     Background statistics and the detection threshold are computed once
@@ -544,6 +666,9 @@ def get_act_im_peaks(act_im, peak_th=3.0, exclusion_mask=None):
     act_im : (Z, H, W) array, may contain NaNs
     peak_th : float, threshold in MAD-normalised standard deviations
     exclusion_mask : None, or bool array broadcastable to (Z, H, W)
+    buffer_size : int, if > 0 detected peaks are buffered by a
+        buffer_size x buffer_size square when suppressing nearby residual
+        peaks (matches MATLAB getActImPeaks bufferSize argument)
 
     Returns
     -------
@@ -577,7 +702,8 @@ def get_act_im_peaks(act_im, peak_th=3.0, exclusion_mask=None):
     source_seeds_list = []
     for z in range(nZ):
         thetaf_z = _detect_peaks_2d(act_im[z], excl_planes[z],
-                                    mu_bg, sigma_bg, peak_thresh, peak_th)
+                                    mu_bg, sigma_bg, peak_thresh, peak_th,
+                                    buffer_size=buffer_size)
         if thetaf_z.shape[0] > 0:
             z_col = np.full((thetaf_z.shape[0], 1), z, dtype=float)
             source_seeds_list.append(
@@ -600,9 +726,9 @@ def get_trial_data(trial_info, DMDix, params, sampFreq, refStack, fastZ2RefZ, al
 
     nPixels = dmdPixelsPerColumn * dmdPixelsPerRow * numFastZs
 
-    source_fn = trialTable['filename'][DMDix,trialIx][0]
-    firstLine = trialTable['firstLine'][DMDix,trialIx]
-    lastLine = trialTable['lastLine'][DMDix,trialIx]
+    source_fn = trialTable['filename'][DMDix,trialIx]
+    firstLine = trialTable['first_line'][DMDix,trialIx]
+    lastLine = trialTable['last_line'][DMDix,trialIx]
 
     importlib.reload(slap2_utils)
     if re.search(r'CYCLE\d+', source_fn):
@@ -643,12 +769,15 @@ def get_trial_data(trial_info, DMDix, params, sampFreq, refStack, fastZ2RefZ, al
     start_line_data_time = time.time()
     print(f"Getting line data for {len(all_lines)} lines", end="")
     # Get all line data at once
-    all_line_data = hDataFile.getLineData(all_lines, all_cycles, params['activityChannel'] if not all_channels else None)
+    all_line_data = hDataFile.getLineData(all_lines, all_cycles, 1 if not all_channels else None)
     print(f" - completed in {time.time() - start_line_data_time:.3f} sec")
+
+    # A second channel is only present when the acquisition has >= 2 channels.
+    read_second = all_channels and params['numChannels'] >= 2
 
     data = np.zeros((numSuperPixels,nDSframes), dtype=np.float32)
     dataCt = np.zeros((numSuperPixels,nDSframes), dtype=np.float32)
-    if all_channels:
+    if read_second:
         data2 = np.zeros((numSuperPixels,nDSframes), dtype=np.float32)
         dataCt2 = np.zeros((numSuperPixels,nDSframes), dtype=np.float32)
     # Initialize timing variables
@@ -696,20 +825,24 @@ def get_trial_data(trial_info, DMDix, params, sampFreq, refStack, fastZ2RefZ, al
                 weight = weights[i]
                 data[matching_indices, DSframeIx] += line_data[matched_positions, 0] * weight
                 dataCt[matching_indices, DSframeIx] += weight
-                if all_channels:
+                if read_second:
                     data2[matching_indices, DSframeIx] += line_data[matched_positions, 1] * weight
                     dataCt2[matching_indices, DSframeIx] += weight
 
-    aData = spio.loadmat(trialTable['fnAdataInt'][DMDix,trialIx][0])['aData'][0,0]
+    aData = load_alignment_data_h5(trialTable['fn_adata'][DMDix,trialIx])
     # aData['DSframes'] = aData['DSframes'] * hDataFile.metaData.linePeriod_s
-    
+
     if all_channels:
-        return data/100, dataCt, aData, DSframes, data2/100, dataCt2
+        if read_second:
+            return data/100, dataCt, aData, DSframes, data2/100, dataCt2
+        else:
+            # Single channel acquisition: no second channel to return.
+            return data/100, dataCt, aData, DSframes, None, None
     else:
         return data/100, dataCt, aData, DSframes
 
-def get_high_res_traces(trial_info, DMDix, params, sampFreq, refStack, subsampleMatrixInds, fastZ2RefZ, sparseHInds, sparseHVals, 
-                allSuperPixelIDs, dr, trialTable, A_final, uniqueMotionDS, motIndsToKeepDS, median_z, psf, soma_sps):
+def get_high_res_traces(trial_info, DMDix, params, sampFreq, refStack, subsampleMatrixInds, fastZ2RefZ, sparseHInds, sparseHVals,
+                allSuperPixelIDs, dr, savedr, trialTable, A_final, uniqueMotionDS, motIndsToKeepDS, median_z, psf, soma_sps):
     trialIx, keepTrial, backgroundDS = trial_info
     
     if not isinstance(A_final, torch.Tensor):
@@ -722,22 +855,25 @@ def get_high_res_traces(trial_info, DMDix, params, sampFreq, refStack, subsample
             np.full((0,nSources),np.nan,dtype=np.float32), \
                 np.full((0,),np.nan), \
                     np.full((0,),np.nan), \
-                        np.full((0,),np.nan), \
+                        np.full((0,params['numChannels']),np.nan,dtype=np.float32), \
                             (np.full((0,),np.nan), np.full((0,),np.nan), np.full((0,),np.nan)), \
                                 (np.full((0,),0,dtype=np.int16), np.full((0,),0,dtype=np.int16), np.full((0,),0,dtype=np.int16)), \
-                                    np.full((0,len(soma_sps)),np.nan,dtype=np.float32)
+                                    np.full((0,len(soma_sps),params['numChannels']),np.nan,dtype=np.float32)
 
-    data_file = os.path.join(dr, f'trial_data_DMD{DMDix+1}_trial{trialIx}.npz')
+    data_file = os.path.join(savedr, f'trial_data_DMD{DMDix+1}_trial{trialIx}.npz')
+    data2NonNorm = None
+    dataCt2 = None
     if os.path.exists(data_file):
         print(f'Loading existing trial data from {data_file}')
         data_arrays = np.load(data_file)
         dataNonNorm = data_arrays['dataNonNorm']
         dataCt = data_arrays['dataCt']
         frames = data_arrays['DSframes']
-        data2NonNorm = data_arrays['data2NonNorm']
-        dataCt2 = data_arrays['dataCt2']
+        if params['numChannels'] >= 2:
+            data2NonNorm = data_arrays['data2NonNorm']
+            dataCt2 = data_arrays['dataCt2']
 
-        aData = spio.loadmat(trialTable['fnAdataInt'][DMDix,trialIx][0])['aData'][0,0]
+        aData = load_alignment_data_h5(trialTable['fn_adata'][DMDix,trialIx])
         aData['DSframes'] = data_arrays['aData_DSframes']
     else:
         dataNonNorm, dataCt, aData, frames, data2NonNorm, dataCt2 = get_trial_data(trial_info[:2], DMDix, params, sampFreq, refStack, fastZ2RefZ, allSuperPixelIDs, dr, trialTable, all_channels=True)
@@ -747,9 +883,10 @@ def get_high_res_traces(trial_info, DMDix, params, sampFreq, refStack, subsample
             'dataCt': dataCt,
             'DSframes': frames,
             'aData_DSframes': aData['DSframes'],
-            'data2NonNorm': data2NonNorm,
-            'dataCt2': dataCt2
         }
+        if params['numChannels'] >= 2:
+            data_arrays['data2NonNorm'] = data2NonNorm
+            data_arrays['dataCt2'] = dataCt2
         np.savez(data_file, **data_arrays)
         print(f'Saved trial data to {data_file}')
     
@@ -760,16 +897,17 @@ def get_high_res_traces(trial_info, DMDix, params, sampFreq, refStack, subsample
     numFastZs = fastZ2RefZ[f'DMD{DMDix+1}'].shape[0]
 
     data = dataNonNorm / dataCt
-    data2 = data2NonNorm / dataCt2
+    if params['numChannels'] >= 2:
+        data2 = data2NonNorm / dataCt2
 
-    motionR = np.interp(frames, aData['DSframes'][0], aData['motionDSr'].T[0])
-    motionC = np.interp(frames, aData['DSframes'][0], aData['motionDSc'].T[0])
-    motionZ = np.interp(frames, aData['DSframes'][0], aData['motionDSz'].T[0])
-    background = np.array([np.interp(frames, aData['DSframes'][0], backgroundDS[i]) for i in range(backgroundDS.shape[0])])
+    motionR = np.interp(frames, aData['DSframes'], aData['motionDSr'])
+    motionC = np.interp(frames, aData['DSframes'], aData['motionDSc'])
+    motionZ = np.interp(frames, aData['DSframes'], aData['motionDSz'])
+    background = np.array([np.interp(frames, aData['DSframes'], backgroundDS[i]) for i in range(backgroundDS.shape[0])])
 
-    onlineYshifts = nearest_interp(frames, aData['DSframes'][0], aData['onlineYshift'].T[0])
-    onlineXshifts = nearest_interp(frames, aData['DSframes'][0], aData['onlineXshift'].T[0])
-    onlineZshifts = nearest_interp(frames, aData['DSframes'][0], aData['onlineZshift'].T[0])
+    onlineYshifts = nearest_interp(frames, aData['DSframes'], aData['onlineYshift'])
+    onlineXshifts = nearest_interp(frames, aData['DSframes'], aData['onlineXshift'])
+    onlineZshifts = nearest_interp(frames, aData['DSframes'], aData['onlineZshift'])
 
     uniqueMotion, motInds = np.unique(np.round(np.stack((motionR, motionC, motionZ), axis=1)), axis=0, return_inverse=True)
     
@@ -853,14 +991,21 @@ def get_high_res_traces(trial_info, DMDix, params, sampFreq, refStack, subsample
         #     Xtbackground
         # ).T
 
-    globalF = np.sum(data, axis=0)
-    globalF[~framesToKeep] = np.nan
+    # Global fluorescence per channel: (frames, channels), order [activity, second].
+    channel_sums = [np.sum(data, axis=0)]
+    if params['numChannels'] >= 2:
+        channel_sums.append(np.sum(data2, axis=0))
+    globalF = np.stack(channel_sums, axis=-1)
+    globalF[~framesToKeep, :] = np.nan
 
-    F_soma = np.full((data.shape[1], len(soma_sps)), np.nan, dtype=np.float32)
+    # Soma/user-ROI fluorescence per channel: (frames, rois, channels), order [activity, second].
+    F_soma = np.full((data.shape[1], len(soma_sps), params['numChannels']), np.nan, dtype=np.float32)
     for i, roi_sps in enumerate(soma_sps):
-        F_soma[:,i] = np.nansum(data2[roi_sps,:], axis=0)
-    
-    F_soma[~framesToKeep] = np.nan
+        F_soma[:,i,0] = np.nansum(data[roi_sps,:], axis=0)
+        if params['numChannels'] >= 2:
+            F_soma[:,i,1] = np.nansum(data2[roi_sps,:], axis=0)
+
+    F_soma[~framesToKeep,:,:] = np.nan
 
     return phi.numpy(), F0.numpy(), frames, selPixIdxs, globalF, \
         (motionR, motionC, motionZ), (onlineYshifts, onlineXshifts, onlineZshifts), F_soma
@@ -885,15 +1030,9 @@ def create_parameter_gui():
     ttk.Entry(main_frame, textvariable=param_vars['analyzeHz'], width=15).grid(row=row, column=1, pady=2)
     row += 1
     
-    # Glutamate Channel
-    ttk.Label(main_frame, text="Glutamate Channel:").grid(row=row, column=0, sticky=tk.W, pady=2)
-    param_vars['activityChannel'] = tk.IntVar(value=1)
-    ttk.Entry(main_frame, textvariable=param_vars['activityChannel'], width=15).grid(row=row, column=1, pady=2)
-    row += 1
-    
     # Decay Tau (s)
     ttk.Label(main_frame, text="Decay Tau (s):").grid(row=row, column=0, sticky=tk.W, pady=2)
-    param_vars['decayTau_s'] = tk.DoubleVar(value=0.05)
+    param_vars['decayTau_s'] = tk.DoubleVar(value=0.15)
     ttk.Entry(main_frame, textvariable=param_vars['decayTau_s'], width=15).grid(row=row, column=1, pady=2)
     row += 1
 
@@ -907,6 +1046,12 @@ def create_parameter_gui():
     ttk.Label(main_frame, text="Denoise Window (s):").grid(row=row, column=0, sticky=tk.W, pady=2)
     param_vars['denoiseWindow_s'] = tk.DoubleVar(value=1)
     ttk.Entry(main_frame, textvariable=param_vars['denoiseWindow_s'], width=15).grid(row=row, column=1, pady=2)
+    row += 1
+
+    # Variance Inflation Factor (noise model)
+    ttk.Label(main_frame, text="Variance Inflation Factor (VIF):").grid(row=row, column=0, sticky=tk.W, pady=2)
+    param_vars['vif'] = tk.DoubleVar(value=1.38)
+    ttk.Entry(main_frame, textvariable=param_vars['vif'], width=15).grid(row=row, column=1, pady=2)
     row += 1
 
     # dXY
@@ -923,7 +1068,7 @@ def create_parameter_gui():
     
     # Operator
     ttk.Label(main_frame, text="Operator:").grid(row=row, column=0, sticky=tk.W, pady=2)
-    param_vars['operator'] = tk.StringVar(value='Maria Goeppert Mayer')
+    param_vars['operator'] = tk.StringVar(value='SLAP2 User')
     ttk.Entry(main_frame, textvariable=param_vars['operator'], width=15).grid(row=row, column=1, pady=2)
     row += 1
 
@@ -935,8 +1080,14 @@ def create_parameter_gui():
     
     # Peak threshold (z-score units above local background)
     ttk.Label(main_frame, text="Peak Threshold:").grid(row=row, column=0, sticky=tk.W, pady=2)
-    param_vars['peakth'] = tk.DoubleVar(value=3.0)
+    param_vars['peakth'] = tk.DoubleVar(value=8.0)
     ttk.Entry(main_frame, textvariable=param_vars['peakth'], width=15).grid(row=row, column=1, pady=2)
+    row += 1
+    
+    # Peak buffer size (pixels, diameter)
+    ttk.Label(main_frame, text="Peak Buffer:").grid(row=row, column=0, sticky=tk.W, pady=2)
+    param_vars['peak_buffer'] = tk.IntVar(value=3)
+    ttk.Entry(main_frame, textvariable=param_vars['peak_buffer'], width=15).grid(row=row, column=1, pady=2)
     row += 1
 
     # Select Soma
@@ -955,13 +1106,14 @@ def create_parameter_gui():
         try:
             result['params'] = {
                 'analyzeHz': param_vars['analyzeHz'].get(),
-                'activityChannel': param_vars['activityChannel'].get(),
                 'decayTau_s': param_vars['decayTau_s'].get(),
                 'baselineWindow_s': param_vars['baselineWindow_s'].get(),
                 'dXY': param_vars['dXY'].get(),
                 'sparse_fac': float(np.exp(param_vars['sparse_fac_log'].get())),
                 'denoiseWindow_s': param_vars['denoiseWindow_s'].get(),
+                'vif': param_vars['vif'].get(),
                 'peakth': param_vars['peakth'].get(),
+                'peak_buffer': param_vars['peak_buffer'].get(),
                 'operator': param_vars['operator'].get(),
                 'max_workers': param_vars['max_workers'].get(),
                 'select_soma': bool(param_vars['select_soma'].get())
@@ -1000,121 +1152,226 @@ def create_parameter_gui():
     return result
 
 
-def _soma_superpixel_lists_from_mask(mask_fastz, sp_fastz, sp_rows, sp_cols):
-    """One list entry per ROI label (1..max); empty if no soma voxels."""
-    mx = int(np.max(mask_fastz))
-    if mx < 1:
-        return []
+def _soma_superpixel_lists_from_masks(roi_masks, sp_fastz, sp_rows, sp_cols):
+    """One superpixel-index list per ROI, from a list of per-ROI boolean masks.
+
+    ROIs may overlap: a superpixel that falls inside several ROIs appears in each
+    of their lists.
+    """
     return [
-        np.flatnonzero(mask_fastz[sp_fastz, sp_rows, sp_cols] == roi + 1)
-        for roi in range(mx)
+        np.flatnonzero(np.asarray(m)[sp_fastz, sp_rows, sp_cols])
+        for m in roi_masks
     ]
 
 
-def save_user_soma_annotation_h5(dr, soma_masks, n_dmds, soma_geo=None):
-    """Write binary (0/1) fast-Z soma masks for all DMDs into dr/user_annotation.h5.
+def _h5_str(ds):
+    """Read an h5 scalar string dataset as a python str (handles bytes/str)."""
+    v = ds[()]
+    if isinstance(v, np.ndarray):
+        v = v.reshape(-1)[0]
+    if isinstance(v, bytes):
+        return v.decode('utf-8', 'replace')
+    return str(v)
 
-    If a DMD key is missing from soma_masks, an all-zero mask is written when soma_geo
-    is provided (shape taken from soma_geo); otherwise that DMD is skipped.
+
+def _write_dict_to_h5group(grp, d):
+    """Write a (JSON-serializable) dict into an h5 group key-by-key.
+
+    Nested dicts become subgroups; scalars/arrays become datasets; bools are stored
+    as uint8; empty/None values are skipped; anything unexpected is stringified.
     """
-    path = os.path.join(dr, 'user_annotation.h5')
-    with h5py.File(path, 'w') as f:
-        f.attrs['description'] = 'Binary soma mask per DMD (uint8: 0=background, 1=selected), shape (Z_fast, Y, X).'
-        for DMDix in range(n_dmds):
-            key = f'DMD{DMDix+1}'
-            if key in soma_masks:
-                m = np.asarray(soma_masks[key], dtype=np.int8)
-            elif soma_geo is not None and key in soma_geo:
-                geo = soma_geo[key]
-                expected = (geo['num_fast_z'], geo['yx_shape'][0], geo['yx_shape'][1])
-                m = np.zeros(expected, dtype=np.int8)
-            else:
+    str_dt = h5py.string_dtype(encoding='utf-8')
+    for key, v in d.items():
+        key = str(key)
+        if isinstance(v, dict):
+            _write_dict_to_h5group(grp.create_group(key), v)
+        elif isinstance(v, bool):
+            grp.create_dataset(key, data=np.uint8(v))
+        elif isinstance(v, str):
+            grp.create_dataset(key, data=v, dtype=str_dt)
+        elif isinstance(v, (int, float)):
+            grp.create_dataset(key, data=v)
+        elif isinstance(v, (list, tuple)):
+            arr = np.asarray(v)
+            if arr.size == 0:
                 continue
-            binary = (m > 0).astype(np.uint8)
-            grp = f.create_group(key)
-            grp.create_dataset('mask', data=binary, compression='gzip', shuffle=True)
+            if arr.dtype.kind in ('U', 'S', 'O'):
+                grp.create_dataset(key, data=np.array([str(x) for x in v], dtype=object), dtype=str_dt)
+            else:
+                grp.create_dataset(key, data=arr)
+        elif v is None:
+            continue
+        else:
+            grp.create_dataset(key, data=str(v), dtype=str_dt)
 
 
-def load_user_soma_annotation_h5(annotation_path, n_dmds, soma_geo):
+def _ask_roi_label(roi_num, path_num, plane_num):
+    """Modal tkinter prompt for a single ROI's text label; defaults to 'ROI{n}'."""
+    text = None
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes('-topmost', True)
+        text = simpledialog.askstring(
+            'ROI label',
+            f'Label for ROI {roi_num} (Path {path_num}, fast-Z plane {plane_num}):',
+            parent=root,
+        )
+        root.destroy()
+    except Exception as e:
+        print(f'Could not prompt for ROI label ({e}); using default.')
+    if not text or not text.strip():
+        return f'ROI{roi_num}'
+    return text.strip()
+
+
+def save_annotations_h5(dr, roi_records_by_dmd, soma_masks, n_dmds, ref_files=None):
+    """Write user ROI annotations to dr/annotations.h5 in the annotation schema.
+
+    Layout:
+      /row_major, /coords_zero_indexed
+      /Path{i}/{dr, fn, n_rois}
+      /Path{i}/roi_###/{type, label, mask, position, ...}
+
+    Rectangles drawn in the OpenCV selector are stored as type='polygon' with a
+    4-vertex `position` ([y, x], 0-indexed) plus the per-ROI binary `mask`
+    (fastz, Y, X). Circle/ellipse fields are not written for rectangles.
+    ``roi_records_by_dmd[key]`` is a list (in ROI order) of dicts with keys
+    'type', 'label', 'position'; the per-ROI boolean mask is taken from
+    ``soma_masks[key][i]`` (a list of per-ROI masks, so ROIs may overlap).
     """
-    Load soma masks from user_annotation.h5 when the file exists.
+    path = os.path.join(dr, 'annotations.h5')
+    str_dt = h5py.string_dtype(encoding='utf-8')
+    ref_files = ref_files or {}
+    with h5py.File(path, 'w') as f:
+        f['row_major'] = 1
+        f['coords_zero_indexed'] = 1
+        for DMDix in range(n_dmds):
+            dmd_key = f'DMD{DMDix+1}'
+            grp = f.create_group(f'Path{DMDix+1}')
 
-    Each DMD group may be absent: that path is treated as no soma selection (all-zero
-    mask, empty soma_sps). If a mask is present but its shape does not match the current
-    experiment geometry, that DMD is also treated as no selection (with a console warning).
+            ref_file = ref_files.get(dmd_key)
+            grp.create_dataset('dr', data=(str(Path(ref_file).parent) if ref_file else ''), dtype=str_dt)
+            grp.create_dataset('fn', data=(Path(ref_file).name if ref_file else ''), dtype=str_dt)
 
-    Returns (skip_manual, soma_masks, soma_sps). skip_manual is True iff the file was
-    read successfully and at least one DMD had a valid mask shape (so OpenCV annotation
-    can be skipped). If the file is missing, unreadable, or no DMD had a valid mask,
-    returns (False, {}, {}) and the caller runs full manual selection for all DMDs.
+            records = roi_records_by_dmd.get(dmd_key, [])
+            grp.create_dataset('n_rois', data=len(records))
 
-    soma_masks values are int8 (0/1) when skip_manual is True; every DMD key is populated.
+            mask_list = soma_masks.get(dmd_key, [])
+            for i, rec in enumerate(records):
+                rgrp = grp.create_group(f'roi_{i:03d}')
+                rgrp.create_dataset('type', data=rec.get('type', 'polygon'), dtype=str_dt)
+                rgrp.create_dataset('label', data=rec.get('label', f'ROI{i+1}'), dtype=str_dt)
+                if i < len(mask_list):
+                    roi_mask = np.asarray(mask_list[i]).astype(np.uint8)
+                    rgrp.create_dataset('mask', data=roi_mask, compression='gzip', shuffle=True)
+                if rec.get('type', 'polygon') == 'polygon' and 'position' in rec:
+                    rgrp.create_dataset('position', data=np.asarray(rec['position'], dtype=np.float64))
+
+
+def load_annotations_h5(annotations_path, n_dmds, soma_geo):
     """
-    if not os.path.exists(annotation_path):
-        return False, {}, {}
+    Load ROI annotations from annotations.h5 (annotation schema) when the file exists.
 
-    soma_masks = {}
-    soma_sps = {}
+    Reconstructs, per path, an integer-label fast-Z mask (label = ROI index + 1),
+    the per-ROI superpixel lists, the text labels, and the raw ROI records. Each
+    Path group may be absent (treated as no selection). If a per-ROI mask shape does
+    not match the current geometry, that path is treated as no selection (warning).
+
+    Returns (skip_manual, soma_masks, soma_sps, soma_labels, roi_records). skip_manual
+    is True iff the file was read and at least one path had >= 1 ROI. On a missing or
+    unreadable file, returns (False, {}, {}, {}, {}) and the caller runs manual selection.
+    """
+    empty = (False, {}, {}, {}, {})
+    if not os.path.exists(annotations_path):
+        return empty
+
+    soma_masks, soma_sps, soma_labels, roi_records = {}, {}, {}, {}
     any_valid = False
     try:
-        with h5py.File(annotation_path, 'r') as hf:
+        with h5py.File(annotations_path, 'r') as hf:
             for DMDix in range(n_dmds):
-                key = f'DMD{DMDix+1}'
-                geo = soma_geo[key]
+                dmd_key = f'DMD{DMDix+1}'
+                path_key = f'Path{DMDix+1}'
+                geo = soma_geo[dmd_key]
                 expected = (geo['num_fast_z'], geo['yx_shape'][0], geo['yx_shape'][1])
-                empty_mask = np.zeros(expected, dtype=np.int8)
 
-                if key not in hf or 'mask' not in hf[key]:
-                    soma_masks[key] = empty_mask
-                    soma_sps[key] = []
+                def _no_selection():
+                    soma_masks[dmd_key] = []   # list of per-ROI masks (none)
+                    soma_sps[dmd_key] = []
+                    soma_labels[dmd_key] = []
+                    roi_records[dmd_key] = []
+
+                grp = hf.get(path_key)
+                if grp is None:
+                    _no_selection()
                     continue
 
-                arr = hf[key]['mask'][()]
-                if arr.shape != expected:
+                n_rois = int(np.asarray(grp['n_rois'][()]).reshape(-1)[0]) if 'n_rois' in grp else 0
+                roi_masks = []            # per-ROI boolean masks (may overlap)
+                labels, recs = [], []
+                bad_shape = False
+                for i in range(n_rois):
+                    rgrp = grp.get(f'roi_{i:03d}')
+                    if rgrp is None:
+                        continue
+                    lbl = _h5_str(rgrp['label']) if 'label' in rgrp else f'ROI{i+1}'
+                    typ = _h5_str(rgrp['type']) if 'type' in rgrp else 'polygon'
+                    if 'mask' in rgrp:
+                        m = np.asarray(rgrp['mask'][()])
+                        if m.shape != expected:
+                            bad_shape = True
+                            break
+                        roi_masks.append(m > 0)
+                    else:
+                        roi_masks.append(np.zeros(expected, dtype=bool))
+                    labels.append(lbl)
+                    rec = {'type': typ, 'label': lbl}
+                    if 'position' in rgrp:
+                        rec['position'] = np.asarray(rgrp['position'][()])
+                    recs.append(rec)
+
+                if bad_shape:
                     print(
-                        f'user_annotation.h5: {key}/mask has shape {arr.shape}, '
-                        f'expected {expected}; treating this DMD as no selection.'
+                        f'annotations.h5: {path_key} ROI mask shape mismatch '
+                        f'(expected {expected}); treating this path as no selection.'
                     )
-                    soma_masks[key] = empty_mask
-                    soma_sps[key] = []
+                    _no_selection()
                     continue
 
-                mask_fastz = (arr > 0).astype(np.int8)
-                soma_masks[key] = mask_fastz
-                soma_sps[key] = _soma_superpixel_lists_from_mask(
-                    mask_fastz, geo['sp_fastz'], geo['sp_rows'], geo['sp_cols']
+                soma_masks[dmd_key] = roi_masks
+                soma_sps[dmd_key] = _soma_superpixel_lists_from_masks(
+                    roi_masks, geo['sp_fastz'], geo['sp_rows'], geo['sp_cols']
                 )
-                any_valid = True
-                plane_counts = [
-                    int(np.count_nonzero(mask_fastz[z])) for z in range(mask_fastz.shape[0])
-                ]
-                nz_planes = [z for z, c in enumerate(plane_counts) if c > 0]
-                if nz_planes:
-                    per_plane = ", ".join(f"plane {z}: {plane_counts[z]}" for z in nz_planes)
-                    print(
-                        f"Loaded soma mask for {key}: "
-                        f"{len(nz_planes)} fast-Z plane(s) with nonzero voxels — {per_plane}"
-                    )
-                else:
-                    print(
-                        f"Loaded soma mask for {key}: "
-                        f"no nonzero voxels on any fast-Z plane (shape {mask_fastz.shape})"
-                    )
+                soma_labels[dmd_key] = labels
+                roi_records[dmd_key] = recs
+                if n_rois > 0:
+                    any_valid = True
+                    print(f'Loaded {n_rois} ROI(s) for {path_key} from annotations.h5')
 
         if not any_valid:
-            return False, {}, {}
-        return True, soma_masks, soma_sps
+            return empty
+        return True, soma_masks, soma_sps, soma_labels, roi_records
     except Exception as e:
-        print(f'Could not read {annotation_path}: {e}')
-        return False, {}, {}
+        print(f'Could not read {annotations_path}: {e}')
+        return empty
 
 
 def main():
-    # load SLAP2 data folder
-    dr = filedialog.askdirectory(initialdir = 'Z:\\scratch\\ophys\\Michael', \
-                                        title = "Select data directory")
-    # dr = 'Z:\\scratch\\ophys\\Michael\\slap2_integration+raster\\slap2_760268_2024-11-05_12-35-49\\fov1\\experiment1'
-    print(dr)
+    # Select the GIAnT trial_table.h5 produced by BandRegistration.m.
+    # datadr / savedr (raw data and results locations) are read from inside it.
+    trialTableFile = filedialog.askopenfilename(
+        initialdir='Z:\\scratch\\ophys\\Michael',
+        title='Select a trial_table .h5 file',
+        filetypes=[('Trial table', '*trial_table*.h5'), ('HDF5 files', '*.h5'), ('All files', '*.*')],
+    )
+    if not trialTableFile:
+        print('No trial table selected')
+        return
+    print(trialTableFile)
+
+    if not os.path.exists(trialTableFile):
+        raise FileNotFoundError(f"Trial table file not found at: {trialTableFile}")
 
     # Show GUI and get parameters
     gui_result = create_parameter_gui()
@@ -1130,59 +1387,83 @@ def main():
     print("selected params:")
     print(params)
 
-    # find trialTable.mat file in data directory
-    trialTableFile = os.path.join(dr, 'trialTable.mat')
-    if not os.path.exists(trialTableFile):
-        raise FileNotFoundError(f"Trial table file not found at: {trialTableFile}")
-    print(trialTableFile)
-
-    ''' trialTable structure
-    trialTable = 
-
-    struct with fields:
-
-                    refStack: {[1×1 struct]  [1×1 struct]}
-                    filename: {2×16 cell}
-                    firstLine: [2×16 double]
-                    lastLine: [2×16 double]
-            trialEndTimeFromPC: [7.3956e+05 7.3956e+05 … ] (1×16 double)
-        trialStartTimeInferred: [7.3956e+05 7.3956e+05 … ] (1×16 double)
-                trueTrialIx: [1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16]
-                        epoch: [1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1]
-                    lookupFile: 'Z:\scratch\ophys\Michael\slap2_integration+raster\slap2_760268_2024-11-05_12-35-49\fov1\experiment1\\integrationRegLookupTable.mat'
-                    fnRegDSInt: {2×16 cell}
-                    fnAdataInt: {2×16 cell}
-                alignParamsInt: [1×1 struct]
-                    fnRegDS: {2×16 cell}
-                    fnAdata: {2×16 cell}
-                alignParams: [1×1 struct]
+    ''' trial_table.h5 structure (GIAnT-MATLAB, written by saveStructToH5.m)
+    🗄️ trial_table.h5
+     ├ 🔤 datadr / 🔤 savedr
+     ├ 🔤 filename            (nDMDs x nTrials)
+     ├ 🔢 true_trial_ix / epoch
+     ├ 📁 slap2_info
+     |  ├ 📁 ref_stack/Path{N} (IM, channels, Zs, dmdPixel2SampleTransform)
+     |  ├ 🔢 first_line / last_line
+     ├ 📁 motion_correction
+     |  ├ 🔤 fn_adata          (nDMDs x nTrials; basenames under savedr/motion_correction)
+     |  ├ ☑️ registration_failed
+     |  └ 📁 align_params
     '''
 
-    # Get the struct
-    trialTable = spio.loadmat(trialTableFile)['trialTable'][0,0]
+    # Load the GIAnT trial table. datadr holds the raw data; savedr holds pipeline
+    # results, with motion-correction outputs (aData, lookup table) under
+    # savedr/motion_correction.
+    tt = load_struct_from_h5(trialTableFile)
 
-    align_params = {}
-    tmp = trialTable['alignParamsInt'].reshape(-1)[0]
-    for key in trialTable['alignParamsInt'].dtype.names:
-        align_params[key] = to_serializable(np.squeeze(tmp[key]))
+    datadr = str(tt['datadr'])
+    resultdr = str(tt['savedr'])
+    mocosavedr = os.path.join(resultdr, 'motion_correction')
+    annotationsavedr = os.path.join(resultdr, 'annotations')
+    srcextrsavedr = os.path.join(resultdr, 'source_extraction')
 
-    nDMDs = trialTable['filename'].shape[0]
-    nTrials = trialTable['filename'].shape[1]
+    motion_correction = tt.get('motion_correction', {}) or {}
+    slap2_info = tt.get('slap2_info', {}) or {}
+
+    # (fn_adata, align_params, registration_failed); fall back to the flat layout.
+
+    align_params = {
+        key: to_serializable(val)
+        for key, val in (motion_correction.get('align_params', {}) or {}).items()
+    }
+
+    filenames = np.atleast_2d(np.asarray(tt['filename'], dtype=object))
+    first_line = np.atleast_2d(np.asarray(slap2_info['first_line']))
+    last_line = np.atleast_2d(np.asarray(slap2_info['last_line']))
+    fn_adata = np.atleast_2d(np.asarray(motion_correction['fn_adata'], dtype=object))
+
+    nDMDs, nTrials = filenames.shape
+
+    # Resolve aData filenames (stored as basenames) to absolute paths under
+    # savedr/motion_correction.
+    fn_adata_full = np.empty((nDMDs, nTrials), dtype=object)
+    for DMDix in range(nDMDs):
+        for trialIx in range(nTrials):
+            entry = fn_adata[DMDix, trialIx]
+            fn_adata_full[DMDix, trialIx] = (
+                '' if entry in (None, '') else os.path.join(mocosavedr, str(entry))
+            )
+
+    # Normalized trial table consumed by get_trial_data / get_high_res_traces.
+    trialTable = {
+        'filename': filenames,
+        'first_line': first_line,
+        'last_line': last_line,
+        'fn_adata': fn_adata_full,
+        'datadr': datadr,
+        'savedr': resultdr,
+        'ref_stack': slap2_info.get('ref_stack', {}) or {},
+    }
 
     # Verify all required files exist
     keepTrials = np.ones((nDMDs, nTrials), dtype=bool)
 
     for trialIx in range(nTrials-1, -1, -1):
-        for DMDix in range(nDMDs):                
-            # Check alignment data files
-            align_fn = os.path.splitext(os.path.basename(trialTable['fnAdataInt'][DMDix,trialIx][0]))[0]
-            if not os.path.exists(os.path.join(dr, align_fn + '.mat')):
+        for DMDix in range(nDMDs):
+            # Check alignment data files (per-trial _ALIGNMENTDATA.h5 under motion_correction)
+            align_fn = trialTable['fn_adata'][DMDix,trialIx]
+            if not align_fn or not os.path.exists(align_fn):
                 print(f'Missing alignData file: {align_fn}')
                 keepTrials[DMDix,trialIx] = False
-                
+
             # Check source data files
-            source_fn = trialTable['filename'][DMDix,trialIx][0]
-            if not os.path.exists(os.path.join(dr, source_fn)):
+            source_fn = trialTable['filename'][DMDix,trialIx]
+            if not source_fn or not os.path.exists(os.path.join(datadr, str(source_fn))):
                 print(f'Missing source data file: {source_fn}')
                 keepTrials[DMDix,trialIx] = False
 
@@ -1194,57 +1475,36 @@ def main():
 
     firstValidTrial = np.where(np.all(keepTrials,axis=0))[0][0]
 
-    # Create ExperimentSummary directory if it doesn't exist
-    savedr = os.path.join(dr, 'ExperimentSummary')
-    if not os.path.exists(savedr):
-        os.makedirs(savedr)
-    output_h5_filename = os.path.join(savedr, f'experiment_summary_{datetime.now().strftime("%Y%m%d-%H%M%S")}.h5')
+    # Source-extraction outputs (experiment_summary.h5) go under resultdr/source_extraction
+    if not os.path.exists(srcextrsavedr):
+        os.makedirs(srcextrsavedr)
+    output_h5_filename = os.path.join(srcextrsavedr, f'experiment_summary.h5')
 
-    # Load aData file
-    # aData = spio.loadmat(trialTable['fnAdataInt'][0,firstValidTrial][0])['aData'][0,0]
-
-    # params['numChannels'] = aData['numChannels'][0,0]
-    # params['alignHz'] = aData['alignHz'][0,0]
-
-    # Get the lookup file path
-    lookupFile = trialTable['lookupFile'][0]
-
-    ''' Lookup table structure
-    lookupTable = 
-
-    struct with fields:
-
-        likelihood_means: {[5-D single]  [5-D single]}
-        allSuperPixelIDs: {[3786×1 uint32]  [2699×1 uint32]}
-        sparseMaskInds: {[34102×2 uint32]  [24255×2 uint32]}
-                    xPre: 25
-                xPost: 25
-                    yPre: 25
-                yPost: 25
-                    zPre: 10
-                zPost: 10
+    ''' bandRegLookupTable.h5 structure (GIAnT-MATLAB)
+    🗄️ bandRegLookupTable.h5
+     ├ 🔢 xPre / xPost / yPre / yPost
+     └ 📁 Path{N}
+        ├ 📈 likelihood_means (Y x X x Z x C x nSP)
+        ├ 🔢 allSuperPixelIDs (nSP x 1)
+        ├ 🔢 sparseMaskInds   (N x 2)
+        ├ 🔢 zPre / zPost
+        └ 📈 fastZ2RefZ
     '''
 
-    with h5py.File(lookupFile, 'r') as f:
-        lt = f['lookupTable']
-        refs = f['#refs#']
-        
-        # see if this can be made compatible for variable nDMDs
-        # allSuperPixelIDs
-        allSuperPixelIDs_refs = lt['allSuperPixelIDs'][:].flat
-        allSuperPixelIDs = {'DMD1': refs[allSuperPixelIDs_refs[0]][:].T.astype(np.int32),
-                            'DMD2': refs[allSuperPixelIDs_refs[1]][:].T.astype(np.int32)}
-        
-        # sparseMaskInds
-        sparseMaskInds_refs = lt['sparseMaskInds'][:].flat
-        sparseMaskInds = {'DMD1': refs[sparseMaskInds_refs[0]][:].T.astype(np.int32),
-                        'DMD2': refs[sparseMaskInds_refs[1]][:].T.astype(np.int32)}
-        
-        fastZ2RefZ_refs = lt['fastZ2RefZ'][:].flat
-        fastZ2RefZ = {'DMD1': refs[fastZ2RefZ_refs[0]][:].T.astype(np.int32),
-                    'DMD2': refs[fastZ2RefZ_refs[1]][:].T.astype(np.int32)}
+    # Load the integration-registration lookup table.
+    lookupFile = os.path.join(mocosavedr, 'bandRegLookupTable.h5')
+    if not os.path.exists(lookupFile):
+        raise FileNotFoundError(f"Lookup table not found at: {lookupFile}")
 
-    del sparseMaskInds_refs, allSuperPixelIDs_refs, fastZ2RefZ_refs
+    lt = load_struct_from_h5(lookupFile)
+    allSuperPixelIDs = {}
+    sparseMaskInds = {}
+    fastZ2RefZ = {}
+    for DMDix in range(nDMDs):
+        p = lt.get(f'Path{DMDix+1}', lt.get(f'DMD{DMDix+1}'))
+        allSuperPixelIDs[f'DMD{DMDix+1}'] = np.asarray(p['allSuperPixelIDs']).reshape(-1, 1).astype(np.int32)
+        sparseMaskInds[f'DMD{DMDix+1}'] = np.asarray(p['sparseMaskInds']).astype(np.int32)
+        fastZ2RefZ[f'DMD{DMDix+1}'] = np.asarray(p['fastZ2RefZ']).reshape(-1, 1).astype(np.int32)
 
     # Extract superpixel locations and print shapes to verify
     print("Shapes:")
@@ -1262,30 +1522,31 @@ def main():
         print(f"allSuperPixelIDs DMD{DMDix+1}: {allSuperPixelIDs['DMD'+str(DMDix+1)].shape}")
         print(f"sparseMaskInds DMD{DMDix+1}: {sparseMaskInds['DMD'+str(DMDix+1)].shape}")
 
-    # get integration reference stack
+    # get integration reference stack: read the REFERENCE tif from datadr, but take
+    # the channel list from the trial table's embedded ref_stack metadata.
     refStack = {}
+    ref_channels = {}
+    ref_files = {}
     for DMDix in range(nDMDs):
+        rs_grp = _ref_stack_group(trialTable['ref_stack'], DMDix)
+        channels = np.asarray(rs_grp['channels']).reshape(-1)
+        ref_channels[f'DMD{DMDix+1}'] = channels
+        numChannels = len(channels)
+
         pattern = f"**/*DMD{DMDix+1}_CONFIG2-REFERENCE*"
-        matching_files = list(Path(dr).glob(pattern))
+        matching_files = list(Path(datadr).glob(pattern))
+        if not matching_files:
+            pattern = f"**/*DMD{DMDix+1}-REFERENCE*"
+            matching_files = list(Path(datadr).glob(pattern))
         if matching_files:
             first_file = str(matching_files[0])
+            ref_files[f'DMD{DMDix+1}'] = first_file
             print(f"DMD{DMDix+1} ref stack file: {first_file}")
-            numChannels = len(trialTable['refStack'][0,DMDix]['channels'][0,0].T)
             refStackTmp = skimio.imread(first_file) / 100
             refStackTmp = refStackTmp.reshape(-1, numChannels, refStackTmp.shape[1], refStackTmp.shape[2]).transpose(1,0,2,3)
             refStack[f'DMD{DMDix+1}'] = refStackTmp
         else:
-            pattern = f"**/*DMD{DMDix+1}-REFERENCE*"
-            matching_files = list(Path(dr).glob(pattern))
-            if matching_files:
-                first_file = str(matching_files[0])
-                print(f"DMD{DMDix+1} ref stack file: {first_file}")
-                numChannels = len(trialTable['refStack'][0,DMDix]['channels'][0,0].T)
-                refStackTmp = skimio.imread(first_file) / 100
-                refStackTmp = refStackTmp.reshape(-1, numChannels, refStackTmp.shape[1], refStackTmp.shape[2]).transpose(1,0,2,3)
-                refStack[f'DMD{DMDix+1}'] = refStackTmp
-            else:
-                print(f"No matching files found for DMD{DMDix+1}")
+            print(f"No matching files found for DMD{DMDix+1}")
 
     # Always load per-DMD acquisition params (numChannels, alignHz) and motion medians
     # from aData, regardless of whether manual soma selection is enabled.
@@ -1293,20 +1554,22 @@ def main():
     aData_by_dmd = {}
     motion_medians = {}
     for DMDix in range(nDMDs):
-        aData = spio.loadmat(trialTable['fnAdataInt'][DMDix, firstValidTrial][0])['aData'][0, 0]
-        params['numChannels'] = aData['numChannels'][0, 0]
-        params['alignHz'][f'DMD{DMDix+1}'] = aData['alignHz'][0, 0]
+        aData = load_alignment_data_h5(trialTable['fn_adata'][DMDix, firstValidTrial])
+        params['numChannels'] = aData['numChannels']
+        params['alignHz'][f'DMD{DMDix+1}'] = aData['alignHz']
         aData_by_dmd[f'DMD{DMDix+1}'] = aData
         motion_medians[f'DMD{DMDix+1}'] = (
-            int(np.nanmedian(np.round(aData['motionDSr'].T[0]))),
-            int(np.nanmedian(np.round(aData['motionDSc'].T[0]))),
-            int(np.nanmedian(np.round(aData['motionDSz'].T[0]))),
+            int(np.nanmedian(np.round(aData['motionDSr']))),
+            int(np.nanmedian(np.round(aData['motionDSc']))),
+            int(np.nanmedian(np.round(aData['motionDSz']))),
         )
 
     # Optional manual soma selection on reference images (scroll through fast-Z planes)
+    soma_masks = {}
     soma_sps = {f'DMD{DMDix+1}': [] for DMDix in range(nDMDs)}
+    soma_labels = {f'DMD{DMDix+1}': [] for DMDix in range(nDMDs)}
     if params['select_soma']:
-        annotation_path = os.path.join(dr, 'user_annotation.h5')
+        annotation_path = os.path.join(annotationsavedr, 'annotations.h5')
         soma_geo = {}
         for DMDix in range(nDMDs):
             avg_motionR, avg_motionC, avg_motionZ = motion_medians[f'DMD{DMDix+1}']
@@ -1350,17 +1613,19 @@ def main():
                 'sp_mask': sp_mask,
             }
 
-        loaded_ok, masks_ld, sps_ld = load_user_soma_annotation_h5(annotation_path, nDMDs, soma_geo)
+        loaded_ok, masks_ld, sps_ld, labels_ld, _records_ld = load_annotations_h5(annotation_path, nDMDs, soma_geo)
         if loaded_ok:
             soma_masks.update(masks_ld)
             soma_sps.update(sps_ld)
+            soma_labels.update(labels_ld)
             print(
-                f'Loaded soma masks from {annotation_path}; skipping manual annotation '
-                f'(DMDs without a valid mask in the file are treated as no selection).'
+                f'Loaded ROI annotations from {annotation_path}; skipping manual annotation '
+                f'(paths without ROIs in the file are treated as no selection).'
             )
         else:
             print('Manually select soma mask on each DMD based on the reference image')
             print('Controls: E=edit/add ROIs on current plane, N/P=next/prev plane, ESC/Q=finish DMD')
+            roi_records = {f'DMD{DMDix+1}': [] for DMDix in range(nDMDs)}
             for DMDix in range(nDMDs):
                 dmd_key = f'DMD{DMDix+1}'
                 g = soma_geo[dmd_key]
@@ -1375,7 +1640,8 @@ def main():
                 sp_rows = g['sp_rows']
                 sp_cols = g['sp_cols']
 
-                mask_fastz = np.zeros((num_fast_z, *yx_shape), dtype=np.int8)
+                roi_masks = []                                            # per-ROI boolean masks (may overlap)
+                roi_union = np.zeros((num_fast_z, *yx_shape), dtype=bool)  # union of ROIs, for display only
 
                 window_name = f'Select soma ROI(s) DMD{DMDix+1}'
                 cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
@@ -1412,9 +1678,9 @@ def main():
                         sp_color[sp_mask[curr_fz]] = (0, 255, 0)
                         alpha_sp = 0.25
                         disp = cv2.addWeighted(disp, 1 - alpha_sp, sp_color, alpha_sp, 0)
-                    if (mask_fastz[curr_fz] > 0).any():
+                    if roi_union[curr_fz].any():
                         roi_color = np.zeros_like(disp)
-                        roi_color[mask_fastz[curr_fz] > 0] = (0, 0, 255)
+                        roi_color[roi_union[curr_fz]] = (0, 0, 255)
                         alpha_roi = 0.3
                         disp = cv2.addWeighted(disp, 1 - alpha_roi, roi_color, alpha_roi, 0)
                     cv2.imshow(window_name, disp)
@@ -1431,10 +1697,25 @@ def main():
                         rois = cv2.selectROIs(edit_name, edit_disp, showCrosshair=True, fromCenter=False)
                         cv2.resizeWindow(edit_name, 800, 500)
                         if rois is not None and len(rois) > 0:
-                            next_label = int(np.max(mask_fastz)) + 1
                             for (x, y, w, h) in rois:
-                                mask_fastz[curr_fz, y : y + h, x : x + w] = next_label
-                                next_label += 1
+                                roi_num = len(roi_masks) + 1
+                                # Each ROI is its own boolean mask, so ROIs may overlap.
+                                m = np.zeros((num_fast_z, *yx_shape), dtype=bool)
+                                m[curr_fz, y : y + h, x : x + w] = True
+                                roi_masks.append(m)
+                                roi_union[curr_fz, y : y + h, x : x + w] = True
+                                # Prompt for a text label; store this ROI as a polygon
+                                # (rectangle) with 0-indexed [y, x] corner vertices.
+                                label_text = _ask_roi_label(roi_num, DMDix + 1, curr_fz + 1)
+                                position = np.array(
+                                    [[y, x], [y, x + w], [y + h, x + w], [y + h, x]],
+                                    dtype=np.float64,
+                                )
+                                roi_records[dmd_key].append({
+                                    'type': 'polygon',
+                                    'label': label_text,
+                                    'position': position,
+                                })
                             print(f'Added {len(rois)} ROI(s) at fast-Z {curr_fz+1} for DMD{DMDix+1}')
                         cv2.destroyWindow(edit_name)
                     elif keycode == ord('n'):
@@ -1450,21 +1731,24 @@ def main():
 
                 cv2.destroyWindow(window_name)
 
-                soma_masks[dmd_key] = mask_fastz
-                soma_sps[dmd_key] = _soma_superpixel_lists_from_mask(mask_fastz, sp_fastz, sp_rows, sp_cols)
+                soma_masks[dmd_key] = roi_masks
+                soma_sps[dmd_key] = _soma_superpixel_lists_from_masks(roi_masks, sp_fastz, sp_rows, sp_cols)
+                soma_labels[dmd_key] = [rec['label'] for rec in roi_records[dmd_key]]
 
-            save_user_soma_annotation_h5(dr, soma_masks, nDMDs, soma_geo=soma_geo)
-            print(f'Saved soma masks to {annotation_path}')
+            if not os.path.exists(annotationsavedr):
+                os.makedirs(annotationsavedr)
+            save_annotations_h5(annotationsavedr, roi_records, soma_masks, nDMDs, ref_files=ref_files)
+            print(f'Saved ROI annotations to {annotation_path}')
 
     # Get dilation 17 PSF or load in from file
     pattern = f"**/*DMD*-REFERENCE*"
-    matching_files = list(Path(dr).glob(pattern))
+    matching_files = list(Path(datadr).glob(pattern))
     if matching_files:
         first_file = str(matching_files[0])
         first_file_name = os.path.splitext(os.path.basename(first_file))[0].split('_DMD')[0]
-        psf_path = os.path.join(dr, first_file_name + '-PSF.tif')
+        psf_path = os.path.join(resultdr, first_file_name + '-PSF.tif')
     else:
-        psf_path = os.path.join(dr, 'refStack-PSF.tif')
+        psf_path = os.path.join(resultdr, 'refStack-PSF.tif')
         print(f"No ref stack found")
 
     if not os.path.exists(psf_path):
@@ -1508,7 +1792,7 @@ def main():
         # Crop the PSF
         psf[f'DMD{DMDix+1}'] = psf[f'DMD{DMDix+1}'][row_start:row_end+1, col_start:col_end+1]
 
-    for DMDix in range(nDMDs): 
+    for DMDix in range(nDMDs):
         # range(nDMDs-1, -1, -1):
         print(f'Processing DMD{DMDix+1}')
 
@@ -1559,24 +1843,25 @@ def main():
             refStack=refStack,
             fastZ2RefZ=fastZ2RefZ,
             allSuperPixelIDs=allSuperPixelIDs,
-            dr=dr,
+            dr=datadr,
             trialTable=trialTable,
             all_channels=True
         )
 
-        data_file = os.path.join(dr, f'lowres_data_DMD{DMDix+1}.npz')
+        data_file = os.path.join(resultdr, f'lowres_data_DMD{DMDix+1}.npz')
         
         if os.path.exists(data_file):
             print(f'Loading existing low resolution data from {data_file}')
             with np.load(data_file) as data_arrays:
                 lowResData = data_arrays['lowResData']
-                lowResDataCt = data_arrays['lowResDataCt'] 
+                lowResDataCt = data_arrays['lowResDataCt']
                 lowResMotionR = data_arrays['lowResMotionR']
                 lowResMotionC = data_arrays['lowResMotionC']
                 lowResMotionZ = data_arrays['lowResMotionZ']
                 lowResTrialID = data_arrays['lowResTrialID']
-                lowResData2 = data_arrays['lowResData2']
-                lowResDataCt2 = data_arrays['lowResDataCt2']
+                if params['numChannels'] >= 2:
+                    lowResData2 = data_arrays['lowResData2']
+                    lowResDataCt2 = data_arrays['lowResDataCt2']
         else:
             with mp.Pool(processes=min(params['max_workers'],min(mp.cpu_count(),len(trial_info)))) as pool:
                 results = list(pool.imap(get_trial_data_partial, trial_info))
@@ -1587,8 +1872,6 @@ def main():
             lowResMotionC = np.concatenate([r[2]['motionDSc'] for r in results if r is not None], axis=0)
             lowResMotionZ = np.concatenate([r[2]['motionDSz'] for r in results if r is not None], axis=0)
             lowResTrialID = np.concatenate([np.ones_like(r[3])*i for i,r in enumerate(results) if r is not None], axis=0)
-            lowResData2 = np.concatenate([r[4] for r in results if r is not None], axis=1)
-            lowResDataCt2 = np.concatenate([r[5] for r in results if r is not None], axis=1)
 
             # Save data arrays
             data_arrays = {
@@ -1598,18 +1881,24 @@ def main():
                 'lowResMotionC': lowResMotionC,
                 'lowResMotionZ': lowResMotionZ,
                 'lowResTrialID': lowResTrialID,
-                'lowResData2': lowResData2,
-                'lowResDataCt2': lowResDataCt2
             }
+            if params['numChannels'] >= 2:
+                lowResData2 = np.concatenate([r[4] for r in results if r is not None], axis=1)
+                lowResDataCt2 = np.concatenate([r[5] for r in results if r is not None], axis=1)
+                data_arrays['lowResData2'] = lowResData2
+                data_arrays['lowResDataCt2'] = lowResDataCt2
+
             np.savez(data_file, **data_arrays)
             print(f'Saved low resolution data to {data_file}')
 
         lowResDataNorm = lowResData / lowResDataCt
-        lowResData2Norm = lowResData2 / lowResDataCt2
         vIM = 1 / lowResDataCt
-        del lowResData, lowResData2, lowResDataCt, lowResDataCt2
+        del lowResData, lowResDataCt
+        if params['numChannels'] >= 2:
+            lowResData2Norm = lowResData2 / lowResDataCt2
+            del lowResData2, lowResDataCt2
         
-        uniqueMotion, motInds = np.unique(np.round(np.concatenate((lowResMotionR,lowResMotionC,lowResMotionZ),axis=1)),axis=0,return_inverse=True)
+        uniqueMotion, motInds = np.unique(np.round(np.stack((lowResMotionR,lowResMotionC,lowResMotionZ),axis=1)),axis=0,return_inverse=True)
         # Calculate the median from the full lowResMotionZ array, then filter uniqueMotion directly
         median_z = np.median(lowResMotionZ)
         # Boolean mask: True if within 1.5 um from median Z and has >100 frames
@@ -1621,14 +1910,15 @@ def main():
 
         # after filtering out frames with large Z motion, we can consider there to be no Z motion in the remaining frames
 
-        mean_im = np.full((2,numFastZs,dmdPixelsPerColumn,dmdPixelsPerRow), np.nan, dtype=np.float32)
+        mean_im = np.full((params['numChannels'],numFastZs,dmdPixelsPerColumn,dmdPixelsPerRow), np.nan, dtype=np.float32)
         most_common_mot = np.argmax(np.bincount(motInds))
         mean_im[0,refD,refR + int(uniqueMotion[most_common_mot,0]),refC + int(uniqueMotion[most_common_mot,1])] = np.nanmean(lowResDataNorm[:,framesToKeep], axis=1)
-        mean_im[1,refD,refR + int(uniqueMotion[most_common_mot,0]),refC + int(uniqueMotion[most_common_mot,1])] = np.nanmean(lowResData2Norm[:,framesToKeep], axis=1)
-        del lowResData2Norm
+        if params['numChannels'] >= 2:
+            mean_im[1,refD,refR + int(uniqueMotion[most_common_mot,0]),refC + int(uniqueMotion[most_common_mot,1])] = np.nanmean(lowResData2Norm[:,framesToKeep], axis=1)
+            del lowResData2Norm
 
         motIndsYX = -1*np.ones((len(motInds),), dtype=np.int32)
-        uniqueMotionToKeepYX, motIndsYX[framesToKeep] = np.unique(np.round(np.concatenate((lowResMotionR,lowResMotionC),axis=1)[framesToKeep,:]),axis=0,return_inverse=True)
+        uniqueMotionToKeepYX, motIndsYX[framesToKeep] = np.unique(np.round(np.stack((lowResMotionR,lowResMotionC),axis=1)[framesToKeep,:]),axis=0,return_inverse=True)
 
         selPixMask = np.zeros((numFastZs,dmdPixelsPerColumn,dmdPixelsPerRow), dtype=bool)
         for i in range(len(uniqueMotionToKeepYX)):
@@ -1919,8 +2209,20 @@ def main():
 
         # del background_imputed, background_old, U, s, Vt, background_approx
 
+        # Fit an affine noise variance model Var ~= Vk*(background*vIM) + Vb,
+        # calibrated from the data, then z-score the residual by its std.
+        vif = params.get('vif', 1.38)
+        first_valid_frames = np.flatnonzero(np.any(~np.isnan(background[:, :1000]), axis=0))
+        var_im = np.nanvar(lowResDataNorm[:, first_valid_frames], axis=1)
+        Vb = np.nanpercentile(var_im, 5) * vif
+        var_pred = (np.nanmean(background[:, first_valid_frames], axis=1)
+                    * np.nanmean(vIM[:, first_valid_frames], axis=1))
+        sel_bright = var_pred > np.nanpercentile(var_pred, 90)
+        Vk = np.nanpercentile((var_im[sel_bright] - (Vb / vif)) / var_pred[sel_bright], 10)
+        data_std = np.sqrt(np.clip(Vk * background * vIM, 0, None) + Vb)
+
         residualRaw = lowResDataNorm - background
-        residual = residualRaw / ((background+0.5) * vIM)
+        residual = residualRaw / data_std
         del interp_data_background
 
         # precompute H matrices
@@ -2214,8 +2516,11 @@ def main():
         if params['select_soma'] and (f'DMD{DMDix+1}' in soma_masks):
             excl_mask = soma_masks[f'DMD{DMDix+1}'] > 0
 
-        source_seeds = get_act_im_peaks(act_im, peak_th=params.get('peakth', 3.0),
-                                        exclusion_mask=excl_mask)
+        source_seeds = get_act_im_peaks(act_im, peak_th=params.get('peakth', 8),
+                                        exclusion_mask=excl_mask, buffer_size=params.get('peak_buffer', 3))
+
+        # Raw detected peaks [z, y, x] before NMF sorting/pruning mutates source_seeds.
+        act_im_peaks = source_seeds.copy()
 
         nSources = source_seeds.shape[0]
 
@@ -2582,6 +2887,26 @@ def main():
             overall_losses[outer_loop_iters] += torch.sum((data_for_nmf[:, motion_frames] - X @ phi_lowRes[motion_frames,:].T) ** 2).item()
         print(f"Final overall loss: {overall_losses[outer_loop_iters]}")
 
+        # Low-resolution per-source SNR (variance explained / residual variance) for the
+        # final source set, computed once with the same formula used during pruning.
+        residual_ls = torch.zeros_like(data_for_nmf, dtype=torch.float32)
+        residual_ls[:] = np.nan
+        for i in range(uniqueMotionToKeepYX.shape[0]):
+            motion_frames = (motIndsYX == i).nonzero()[0]
+            X = torch.sparse.mm(H_mots[i], A[selPixIdxs,:])
+            residual_ls[:,motion_frames] = data_for_nmf[:,motion_frames] - X @ phi_lowRes[motion_frames,:].T
+
+        varExpSource = torch.zeros(nSources, dtype=torch.float32)
+        varResidual = torch.zeros(nSources, dtype=torch.float32)
+        for j in range(nSources):
+            for i in range(uniqueMotionToKeepYX.shape[0]):
+                motion_frames = (motIndsYX == i).nonzero()[0]
+                X = torch.sparse.mm(H_mots[i], A[selPixIdxs,j].unsqueeze(1))
+                contributingPixs = (X > 0).nonzero()[:,0]
+                varExpSource[j] += torch.sum(torch.sum(X[contributingPixs] * phi_lowRes[motion_frames,j].unsqueeze(-1).T,dim=0)**2)
+                varResidual[j] += torch.sum(torch.sum(residual_ls[contributingPixs][:,motion_frames],dim=0)**2)
+        source_SNR = (varExpSource / varResidual).numpy()
+
         trial_info = [(i, keepTrials[DMDix,i], background[:,lowResTrialID == i]) for i in range(nTrials)]
 
         get_high_res_traces_partial = partial(get_high_res_traces,
@@ -2594,8 +2919,9 @@ def main():
                                               sparseHInds=sparseHInds,
                                               sparseHVals=sparseHVals,
                                               allSuperPixelIDs=allSuperPixelIDs,
-                                              dr=dr, 
-                                              trialTable=trialTable, 
+                                              dr=datadr,
+                                              savedr=resultdr,
+                                              trialTable=trialTable,
                                               A_final=A,
                                               uniqueMotionDS=uniqueMotionToKeepYX,
                                               motIndsToKeepDS=np.arange(uniqueMotionToKeepYX.shape[0]),
@@ -2608,21 +2934,37 @@ def main():
 
         # Save data to HDF5 file
         with h5py.File(output_h5_filename, 'a') as f:
+            # Root layout flag: arrays are written in NumPy C-order (row-major).
+            if 'row_major' not in f:
+                f['row_major'] = 1
+
+            # Analysis parameters (write once at the root).
+            if 'params' not in f:
+                _write_dict_to_h5group(f.create_group('params'), to_serializable(params))
+
             # Delete group if it exists
-            group_name = f'DMD{DMDix+1}'
+            group_name = f'Path{DMDix+1}'
             if group_name in f:
                 del f[group_name]
             
             # Create group and add datasets
             dmd_group = f.create_group(group_name)
-            
+
+            # Per-fast-Z depth (reference-stack Z index) for this path, (fastz, 1).
+            dmd_group.create_dataset('Z_depths', data=fastZ2RefZ[f'DMD{DMDix+1}'])
+
             # Create subgroups for trial data
             source_group = dmd_group.create_group('sources')
 
             spatial_group = source_group.create_group('spatial')
 
             # spatial_group.create_dataset('source_params', data=source_params.numpy())
-            spatial_group.create_dataset('profiles', data=A.numpy().reshape(dmdPixelsPerRow,dmdPixelsPerColumn,-1).transpose(2,0,1))
+            # profiles: (sources, fastz, rows, cols). A is (nPixels, nSources) with the
+            # pixel axis flattened as z*(rows*cols) + row*cols + col (rows=dmdPixelsPerColumn,
+            # cols=dmdPixelsPerRow), so transpose then reshape in C-order.
+            spatial_group.create_dataset(
+                'profiles',
+                data=A.numpy().T.reshape(-1, numFastZs, dmdPixelsPerColumn, dmdPixelsPerRow))
             spatial_group.create_dataset('coords', data=source_params[:,:3].numpy())
 
             temporal_group = source_group.create_group('temporal')
@@ -2634,113 +2976,136 @@ def main():
             F0 = compute_f0(F, int(np.ceil(params['denoiseWindow_s']*params['analyzeHz'])), int(np.ceil(params['baselineWindow_s']*params['analyzeHz'])))
             dF = F - F0
             dFF = dF / np.clip(F0, 1e-4, None)
-            temporal_group.create_dataset('dF', data=dF)
-            temporal_group.create_dataset('dFF', data=dFF)
-            temporal_group.create_dataset('F0', data=F0)
+
+            # Per-source temporal traces are saved as (sources, channels, frames).
+            # Only the activity channel (index 0) is filled; the second channel is
+            # reserved (all NaN) until multi-channel source extraction is implemented.
+            def _with_nan_channel(arr):  # (frames, sources) -> (sources, channels, frames)
+                out = np.full((arr.shape[1], params['numChannels'], arr.shape[0]), np.nan, dtype=arr.dtype)
+                out[:, 0, :] = arr.T
+                return out
+
+            temporal_group.create_dataset('dF_ls', data=_with_nan_channel(dF))
+            # temporal_group.create_dataset('dFF', data=_with_nan_channel(dFF))
+            temporal_group.create_dataset('F0', data=_with_nan_channel(F0))
+            # low-resolution per-source SNR, (sources, 1)
+            temporal_group.create_dataset('SNR', data=source_SNR.reshape(-1, 1))
             # temporal_group.create_dataset('F', data=F)
 
             # trial_start_idxs = np.concatenate([[0], np.cumsum([len(r[2]) for r in results])[:-1]])
             trial_num_frames = np.concatenate([[len(r[2])] for r in results])
 
+            # frame_info datasets are written as (N, 1) column vectors per the schema.
             frame_group = dmd_group.create_group('frame_info')
             # frame_group.create_dataset('trial_start_idxs', data=trial_start_idxs)
-            frame_group.create_dataset('trial_num_frames', data=trial_num_frames)
-            frame_group.create_dataset('discard_frames', data=np.any(np.isnan(F), axis=1))
-            frame_group.create_dataset('frame_line_idxs', data=np.concatenate([r[2] for r in results], axis=0))
+            frame_group.create_dataset('trial_num_frames', data=trial_num_frames.reshape(-1, 1))
+            frame_group.create_dataset('discard_frames', data=np.any(np.isnan(F), axis=1).reshape(-1, 1))
+            frame_group.create_dataset('frame_line_idxs', data=np.concatenate([r[2] for r in results], axis=0).reshape(-1, 1))
 
-            frame_group.create_dataset('offlineXshifts', data=np.concatenate([r[5][1] for r in results], axis=0))
-            frame_group.create_dataset('offlineYshifts', data=np.concatenate([r[5][0] for r in results], axis=0))
-            frame_group.create_dataset('offlineZshifts', data=np.concatenate([r[5][2] for r in results], axis=0))
+            frame_group.create_dataset('offlineXshifts', data=np.concatenate([r[5][1] for r in results], axis=0).reshape(-1, 1))
+            frame_group.create_dataset('offlineYshifts', data=np.concatenate([r[5][0] for r in results], axis=0).reshape(-1, 1))
+            frame_group.create_dataset('offlineZshifts', data=np.concatenate([r[5][2] for r in results], axis=0).reshape(-1, 1))
 
-            frame_group.create_dataset('onlineXshifts', data=np.concatenate([r[6][1] for r in results], axis=0))
-            frame_group.create_dataset('onlineYshifts', data=np.concatenate([r[6][0] for r in results], axis=0))
-            frame_group.create_dataset('onlineZshifts', data=np.concatenate([r[6][2] for r in results], axis=0))
+            frame_group.create_dataset('onlineXshifts', data=np.concatenate([r[6][1] for r in results], axis=0).reshape(-1, 1))
+            frame_group.create_dataset('onlineYshifts', data=np.concatenate([r[6][0] for r in results], axis=0).reshape(-1, 1))
+            frame_group.create_dataset('onlineZshifts', data=np.concatenate([r[6][2] for r in results], axis=0).reshape(-1, 1))
 
             # frame_group.create_dataset('selPixIdxs', data=[r[2] for r in results])
 
-            globalF = np.concatenate([r[4] for r in results], axis=0)
+            globalF = np.concatenate([r[4] for r in results], axis=0)  # (total_frames, channels)
             global_group = dmd_group.create_group('global')
-            global_group.create_dataset('F', data=globalF)
+            global_group.create_dataset('F', data=globalF.T)  # (channels, total_frames)
 
             visualizations = dmd_group.create_group('visualizations')
             visualizations.create_dataset('act_im', data=act_im)
-            visualizations.create_dataset('mean_im', data=np.expand_dims(mean_im, axis=0))
+            # mean_im is already (channels, fastz, rows, cols).
+            visualizations.create_dataset('mean_im', data=mean_im)
+            # Raw activity-image peaks [z, y, x] (before NMF sort/prune), (sources, 3).
+            visualizations.create_dataset('act_im_peaks', data=act_im_peaks)
             
             if params['select_soma'] and (f'DMD{DMDix+1}' in soma_masks):
                 user_roi_group = dmd_group.create_group('user_rois')
-                masks_by_roi = np.zeros((numFastZs, *yx_shape, np.max(soma_masks[f'DMD{DMDix+1}'])), dtype=bool)
-                for roi in range(masks_by_roi.shape[3]):
-                    masks_by_roi[:,:,:,roi] = soma_masks[f'DMD{DMDix+1}'] == roi + 1
+                roi_mask_list = soma_masks[f'DMD{DMDix+1}']  # list of per-ROI boolean masks (may overlap)
+                if len(roi_mask_list) > 0:
+                    masks_by_roi = np.stack([np.asarray(m, dtype=bool) for m in roi_mask_list], axis=0)
+                else:
+                    masks_by_roi = np.zeros((0, numFastZs, *yx_shape), dtype=bool)
+                # mask: (rois, fastz, rows, cols)
                 user_roi_group.create_dataset('mask', data=masks_by_roi)
-                user_roi_group.create_dataset('F', data=np.concatenate([r[7] for r in results], axis=0))
 
-            ref_stack_channels = trialTable['refStack'][0,DMDix]['channels'][0,0].squeeze().reshape((-1,))
-            num_ref_stack_channels = len(ref_stack_channels)
-            
-            ref_stack = trialTable['refStack'][0,DMDix]['IM'][0,0].T
-            ref_stack_reshaped = np.zeros((num_ref_stack_channels,ref_stack.shape[0] // num_ref_stack_channels,ref_stack.shape[1], ref_stack.shape[2]), dtype=np.float32)
-            for i in range(ref_stack.shape[0]):
-                c = i % num_ref_stack_channels
-                ref_stack_reshaped[c,i//num_ref_stack_channels,:,:] = ref_stack[i,:,:]
-            del ref_stack
-            
-            ref_stack_dataset = visualizations.create_dataset('ref_stack', data=ref_stack_reshaped)
-            ref_stack_dataset.attrs['channels'] = ref_stack_channels
+                # user-provided text labels, one per ROI (same ROI order as mask/F), (rois, 1).
+                user_roi_group.create_dataset(
+                    'labels', data=np.array(soma_labels[f'DMD{DMDix+1}'], dtype=object).reshape(-1, 1),
+                    dtype=h5py.string_dtype(encoding='utf-8'))
 
-        print(f"Added DMD{DMDix+1} data to {output_h5_filename}")
+                # (total_frames, rois, channels) -> (rois, channels, total_frames)
+                F_soma_all = np.concatenate([r[7] for r in results], axis=0)
+                user_roi_group.create_dataset('F', data=F_soma_all.transpose(1, 2, 0))
+
+            # ref_stack is not part of the experiment_summary.h5 schema; keep the
+            # code around (commented) in case the visualization is needed later.
+            # ref_stack_channels = np.asarray(ref_channels[f'DMD{DMDix+1}']).reshape((-1,))
+            # # refStack was loaded from the REFERENCE tif as [C, Z, Y, X] and scaled by
+            # # 1/100; restore the raw count magnitude for the saved visualization.
+            # ref_stack_reshaped = (refStack[f'DMD{DMDix+1}'] * 100).astype(np.float32)
+            #
+            # ref_stack_dataset = visualizations.create_dataset('ref_stack', data=ref_stack_reshaped)
+            # ref_stack_dataset.attrs['channels'] = ref_stack_channels
+
+        print(f"Added Path{DMDix+1} data to {output_h5_filename}")
 
     end_time = datetime.now(timezone.utc).astimezone()
 
-    try:
-        version = subprocess.check_output(
-            ["git", "-C", str(Path(__file__).resolve().parent), "rev-parse", "HEAD"], text=True
-        ).strip()
-    except:
-        version = "Unknown"
+    # try:
+    #     version = subprocess.check_output(
+    #         ["git", "-C", str(Path(__file__).resolve().parent), "rev-parse", "HEAD"], text=True
+    #     ).strip()
+    # except:
+    #     version = "Unknown"
 
-    p = Processing.create_with_sequential_process_graph(
-        pipelines=[
-            Code(
-                name="SLAP2 band scanning processing pipeline (Python)",
-                url="https://github.com/AllenNeuralDynamics/ophys-slap2-analysis/",
-                version=version,
-            ),
-        ],
-        data_processes=[
-            DataProcess(
-                process_type=ProcessName.VIDEO_MOTION_CORRECTION,
-                pipeline_name="SLAP2 band scanning processing pipeline (Python)",
-                experimenters=[align_params.get('operator', 'Unknown')],
-                stage=ProcessStage.PROCESSING,
-                start_date_time=datetime.fromisoformat(align_params.get('startTime', datetime.now(timezone.utc).astimezone().isoformat())),
-                end_date_time=datetime.fromisoformat(align_params.get('endTime', datetime.now(timezone.utc).astimezone().isoformat())),
-                output_path="..",
-                code=Code(
-                    url="https://github.com/AllenNeuralDynamics/ophys-slap2-analysis/blob/main/matlab/preprocessing/integrationRegistration.m",
-                    version=version,
-                    parameters={key: to_serializable(val) for key, val in align_params.items()},
-                ),
-            ),
-            DataProcess(
-                process_type=ProcessName.VIDEO_ROI_TIMESERIES_EXTRACTION,
-                experimenters=[params.get('operator', 'Unknown')],
-                stage=ProcessStage.PROCESSING,
-                start_date_time=start_time,
-                end_date_time=end_time,
-                output_path=".",
-                pipeline_name="SLAP2 band scanning processing pipeline (Python)",
-                code=Code(
-                    url="https://github.com/AllenNeuralDynamics/ophys-slap2-analysis/blob/main/python/slap2analysis/extractSLAP2IntegrationSources.py",
-                    version=version,
-                    parameters={key: to_serializable(val) for key, val in params.items()}
-                ),
-            ),
-        ],
-    )
+    # p = Processing.create_with_sequential_process_graph(
+    #     pipelines=[
+    #         Code(
+    #             name="SLAP2 band scanning processing pipeline (Python)",
+    #             url="https://github.com/AllenNeuralDynamics/ophys-slap2-analysis/",
+    #             version=version,
+    #         ),
+    #     ],
+    #     data_processes=[
+    #         DataProcess(
+    #             process_type=ProcessName.VIDEO_MOTION_CORRECTION,
+    #             pipeline_name="SLAP2 band scanning processing pipeline (Python)",
+    #             experimenters=[align_params.get('operator', 'Unknown')],
+    #             stage=ProcessStage.PROCESSING,
+    #             start_date_time=datetime.fromisoformat(align_params.get('startTime', datetime.now(timezone.utc).astimezone().isoformat())),
+    #             end_date_time=datetime.fromisoformat(align_params.get('endTime', datetime.now(timezone.utc).astimezone().isoformat())),
+    #             output_path="..",
+    #             code=Code(
+    #                 url="https://github.com/AllenNeuralDynamics/ophys-slap2-analysis/blob/main/matlab/preprocessing/integrationRegistration.m",
+    #                 version=version,
+    #                 parameters={key: to_serializable(val) for key, val in align_params.items()},
+    #             ),
+    #         ),
+    #         DataProcess(
+    #             process_type=ProcessName.VIDEO_ROI_TIMESERIES_EXTRACTION,
+    #             experimenters=[params.get('operator', 'Unknown')],
+    #             stage=ProcessStage.PROCESSING,
+    #             start_date_time=start_time,
+    #             end_date_time=end_time,
+    #             output_path=".",
+    #             pipeline_name="SLAP2 band scanning processing pipeline (Python)",
+    #             code=Code(
+    #                 url="https://github.com/AllenNeuralDynamics/ophys-slap2-analysis/blob/main/python/slap2analysis/extractSLAP2IntegrationSources.py",
+    #                 version=version,
+    #                 parameters={key: to_serializable(val) for key, val in params.items()}
+    #             ),
+    #         ),
+    #     ],
+    # )
 
-    serialized = p.model_dump_json()
-    deserialized = Processing.model_validate_json(serialized)
-    p.write_standard_file(Path(savedr),suffix='_integration.json')
+    # serialized = p.model_dump_json()
+    # deserialized = Processing.model_validate_json(serialized)
+    # p.write_standard_file(Path(savedr),suffix='_integration.json')
 
 if __name__ == '__main__':
     main()
