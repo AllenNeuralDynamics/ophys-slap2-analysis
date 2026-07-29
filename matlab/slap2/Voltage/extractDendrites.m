@@ -819,8 +819,9 @@ if strcmpi(params.storageMode, 'h5')
     end
     rowStart = firstLineRounded - trialFirstLine + 1;
 
-    info = h5info(h5Path, dset);
-    nRows = info.Dataspace.Size(1);
+    % Dataset was created using this same value in initializeH5Outputs.
+    % Avoid repeatedly reopening HDF5 metadata during network writes.
+    nRows = double(trialInfo.trialGlobalNLines(trialIdx));
     if rowStart < 1 || (rowStart + nWrite - 1) > nRows
         error('extractDendrites:H5TrialWriteOutOfBounds', ...
             ['Cannot write DMD%d ROI%d trial %d into %s: rowStart=%d, ' ...
