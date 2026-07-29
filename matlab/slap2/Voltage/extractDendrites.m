@@ -33,16 +33,21 @@ function summary = extractDendrites(dr_or_pathToTrialTable, paramsIn)
 %
 %       dendriticVoltageTraces-YYmmDD-HHMMSS.h5
 %           /traces/trial_####       [nTrialLines x nTotalROIs]
-%           /traces/continuous/DMD#  [nDmdLines x nLocalROIs]
+%           Single-epoch continuous acquisition:
+%               /traces/continuous/DMD#  [nDmdLines x nLocalROIs]
+%           Multi-epoch continuous acquisition:
+%               /traces/epochs/epoch_####/DMD# [nEpochLines x nLocalROIs]
 %
 %   Epoch handling:
 %       Multi-epoch sessions are detected from acquisition filename prefix changes
 %       (for example acquisition_135515_DMD1 -> acquisition_140535_DMD1).
 %       Epoch metadata are saved in summary.epochTable, summary.trialEpoch,
-%       and summary.trialFilePrefix. For non-CYCLE multi-epoch acquisitions,
-%       this function writes trial-sliced outputs; epoch-continuous HDF5 outputs
-%       are intentionally deferred until downstream alignment can account for
-%       behavior-continuous/imaging-discontinuous timebases.
+%       and summary.trialFilePrefix. Each CYCLE epoch is opened and extracted
+%       independently because SLAP2 line coordinates restart after acquisition
+%       restarts. Trial datasets are sliced only from their own source epoch.
+%       When continuous output is requested for a multi-epoch session, each epoch
+%       is stored separately under /traces/epochs/epoch_####/DMD#. Downstream code
+%       must align these acquired blocks to HARP time using imaging_epochs.csv.
 
 import ScanImageTiffReader.ScanImageTiffReader
 
@@ -145,57 +150,110 @@ roiRecords = struct('globalRoiIdx', {}, 'dmdIdx', {}, 'localRoiIdx', {}, ...
 % Discover DMD ROIs, reference images, and ROI bookkeeping
 % -------------------------------------------------------------------------
 
-fprintf('Discovering ROIs and reference images...\n');
+fprintf('Discovering ROIs, reference images, and epoch-specific source files...\n');
 for dmdIdx = 1:nDMDs
-    firstValidTrial = findFirstValidTrial(trialInfo.filename, dmdIdx);
-    firstDatFile = resolveDataFilePath(dr, trialInfo.filename{dmdIdx, firstValidTrial});
+    canonicalMasks = [];
+    canonicalSourceRoiIdx = [];
+    canonicalMeta = [];
+    canonicalLinesPerCycle = [];
+    firstCanonicalDatFile = '';
+    epochRecords = repmat(struct( ...
+        'epochIdx', [], 'filePrefix', '', 'firstTrial', [], 'lastTrial', [], ...
+        'firstDatFile', '', 'totalNumLines', 0, 'nCycles', 0, ...
+        'linesPerCycle', [], 'metadata', struct(), 'available', false), ...
+        1, summary.nEpochs);
 
-    fprintf('  DMD%d metadata: %s\n', dmdIdx, firstDatFile);
-    hMDF = slap2.util.MultiDataFiles(firstDatFile);
-    validateParsePlanCompatibility(hMDF, dmdIdx);
+    for epochIdx = 1:summary.nEpochs
+        epochTrials = find(trialInfo.trialEpoch == epochIdx);
+        validTrials = epochTrials(~cellfun(@isempty, trialInfo.filename(dmdIdx, epochTrials)));
 
-    dmdMeta = getDmdMetadata(hMDF);
-    summary.dmd(dmdIdx).metadata = dmdMeta;
-    summary.dmd(dmdIdx).firstDatFile = firstDatFile;
-    summary.dmd(dmdIdx).totalNumLines = hMDF.totalNumLines;
-    summary.dmd(dmdIdx).nCycles = hMDF.numCycles;
-    summary.dmd(dmdIdx).linesPerCycle = hMDF.header.linesPerCycle;
+        epochRecords(epochIdx).epochIdx = epochIdx;
+        epochRecords(epochIdx).firstTrial = epochTrials(1);
+        epochRecords(epochIdx).lastTrial = epochTrials(end);
+        epochRecords(epochIdx).filePrefix = summary.epochTable.filePrefix{epochIdx};
 
-    [masks, maskImage, sourceRoiIdx] = getIntegrationMasks(hMDF);
-    [refIM, outlines] = loadReferenceImage(dr, dmdIdx, hMDF, masks, params);
+        if isempty(validTrials)
+            warning('extractDendrites:MissingDmdEpoch', ...
+                'DMD%d has no valid source file in epoch %d; this epoch will be left empty.', ...
+                dmdIdx, epochIdx);
+            continue
+        end
 
-    if params.manualROIs
-        assert(~isempty(refIM), ['manualROIs=true requires a reference image. ' ...
-            'Set saveRefImages/loadRefImages to true or provide a compatible reference TIFF.']);
-        refFn = findReferenceTiff(dr, dmdIdx);
-        hROIs = drawROIs(refIM, dr, refFn.name, outlines);
-        waitfor(hROIs.hF);
-        [masks, maskImage, sourceRoiIdx] = masksFromManualROIs(hROIs, hMDF, dmdIdx);
+        firstTrialThisEpoch = validTrials(1);
+        firstDatFile = resolveDataFilePath(dr, trialInfo.filename{dmdIdx, firstTrialThisEpoch});
+        fprintf('  DMD%d epoch %d metadata: %s\n', dmdIdx, epochIdx, firstDatFile);
+        hMDF = slap2.util.MultiDataFiles(firstDatFile);
+        validateParsePlanCompatibility(hMDF, dmdIdx);
+
+        dmdMeta = getDmdMetadata(hMDF);
+        [epochMasks, epochMaskImage, epochSourceRoiIdx] = getIntegrationMasks(hMDF);
+
+        if isempty(canonicalMasks)
+            canonicalMasks = epochMasks;
+            canonicalSourceRoiIdx = epochSourceRoiIdx;
+            canonicalMeta = dmdMeta;
+            canonicalLinesPerCycle = hMDF.header.linesPerCycle;
+            firstCanonicalDatFile = firstDatFile;
+
+            [refIM, outlines] = loadReferenceImage(dr, dmdIdx, hMDF, epochMasks, params);
+            if params.manualROIs
+                assert(summary.nEpochs == 1, ...
+                    ['manualROIs=true is only supported for single-epoch extraction. ' ...
+                     'For multi-epoch sessions, define one stable integration ROI set ' ...
+                     'in the acquisition metadata before extraction.']);
+                assert(~isempty(refIM), ['manualROIs=true requires a reference image. ' ...
+                    'Set saveRefImages/loadRefImages to true or provide a compatible reference TIFF.']);
+                refFn = findReferenceTiff(dr, dmdIdx);
+                hROIs = drawROIs(refIM, dr, refFn.name, outlines);
+                waitfor(hROIs.hF);
+                [canonicalMasks, epochMaskImage, canonicalSourceRoiIdx] = ...
+                    masksFromManualROIs(hROIs, hMDF, dmdIdx);
+            end
+
+            nAnalysisROIs(dmdIdx) = size(canonicalMasks, 3);
+            summary.masks{dmdIdx} = canonicalMasks;
+            summary.maskImages{dmdIdx} = epochMaskImage;
+            if params.saveRefImages
+                summary.refIM{dmdIdx} = refIM;
+            end
+            if params.makePlots
+                plotDmdPreview(dmdIdx, refIM, epochMaskImage);
+            end
+        else
+            validateDmdEpochCompatibility( ...
+                dmdIdx, epochIdx, canonicalMeta, dmdMeta, ...
+                canonicalLinesPerCycle, hMDF.header.linesPerCycle, ...
+                canonicalMasks, epochMasks, canonicalSourceRoiIdx, epochSourceRoiIdx);
+        end
+
+        epochRecords(epochIdx).firstDatFile = firstDatFile;
+        epochRecords(epochIdx).totalNumLines = hMDF.totalNumLines;
+        epochRecords(epochIdx).nCycles = hMDF.numCycles;
+        epochRecords(epochIdx).linesPerCycle = hMDF.header.linesPerCycle;
+        epochRecords(epochIdx).metadata = dmdMeta;
+        epochRecords(epochIdx).available = true;
+
+        delete(hMDF);
+        clear hMDF
     end
 
-    nAnalysisROIs(dmdIdx) = size(masks, 3);
-    summary.masks{dmdIdx} = masks;
-    summary.maskImages{dmdIdx} = maskImage;
-    if params.saveRefImages
-        summary.refIM{dmdIdx} = refIM;
-    end
-
-    if params.makePlots
-        plotDmdPreview(dmdIdx, refIM, maskImage);
-    end
+    assert(~isempty(canonicalMasks), 'No valid filenames found for DMD%d in any epoch.', dmdIdx);
+    summary.dmd(dmdIdx).metadata = canonicalMeta;
+    summary.dmd(dmdIdx).firstDatFile = firstCanonicalDatFile;
+    summary.dmd(dmdIdx).totalNumLines = sum([epochRecords.totalNumLines]);
+    summary.dmd(dmdIdx).nCycles = sum([epochRecords.nCycles]);
+    summary.dmd(dmdIdx).linesPerCycle = canonicalLinesPerCycle;
+    summary.dmd(dmdIdx).epochs = epochRecords;
 
     for localRoiIdx = 1:nAnalysisROIs(dmdIdx)
         globalRoiIdx = numel(roiRecords) + 1;
         roiRecords(globalRoiIdx).globalRoiIdx = globalRoiIdx;
         roiRecords(globalRoiIdx).dmdIdx = dmdIdx;
         roiRecords(globalRoiIdx).localRoiIdx = localRoiIdx;
-        roiRecords(globalRoiIdx).sourceRoiIdx = sourceRoiIdx(localRoiIdx);
-        roiRecords(globalRoiIdx).nPixels = nnz(masks(:, :, localRoiIdx));
+        roiRecords(globalRoiIdx).sourceRoiIdx = canonicalSourceRoiIdx(localRoiIdx);
+        roiRecords(globalRoiIdx).nPixels = nnz(canonicalMasks(:, :, localRoiIdx));
         roiRecords(globalRoiIdx).isManual = logical(params.manualROIs);
     end
-
-    delete(hMDF);
-    clear hMDF
 end
 
 summary.nAnalysisROIs = nAnalysisROIs;
@@ -342,68 +400,111 @@ summary = extractTrialFiles(summary, trialInfo, dr, params, summaryPath, h5Path)
 end
 
 function summary = extractContinuousAcquisition(summary, trialInfo, dr, params, summaryPath, h5Path)
+% Extract every CYCLE acquisition epoch independently. SLAP2 line coordinates
+% restart at one after an acquisition restart, so an epoch-local Trace may only
+% be sliced with trials assigned to the same epoch.
 nDMDs = summary.nDMDs;
 
 for dmdIdx = 1:nDMDs
-    firstValidTrial = findFirstValidTrial(trialInfo.filename, dmdIdx);
-    firstDatFile = resolveDataFilePath(dr, trialInfo.filename{dmdIdx, firstValidTrial});
-    fprintf('\nExtracting continuous traces for DMD%d from %s\n', dmdIdx, firstDatFile);
+    for epochIdx = 1:summary.nEpochs
+        epochTrials = find(trialInfo.trialEpoch == epochIdx);
+        validTrials = epochTrials(~cellfun(@isempty, trialInfo.filename(dmdIdx, epochTrials)));
+        if isempty(validTrials)
+            warning('extractDendrites:MissingDmdEpoch', ...
+                'Skipping DMD%d epoch %d because it has no source file.', dmdIdx, epochIdx);
+            continue
+        end
 
-    hMDF = slap2.util.MultiDataFiles(firstDatFile);
-    localRois = 1:summary.nAnalysisROIs(dmdIdx);
-    batches = makeBatches(localRois, params.maxConcurrentROIs);
+        firstTrialThisEpoch = validTrials(1);
+        firstDatFile = resolveDataFilePath(dr, trialInfo.filename{dmdIdx, firstTrialThisEpoch});
+        fprintf('\nExtracting DMD%d epoch %d/%d from %s\n', ...
+            dmdIdx, epochIdx, summary.nEpochs, firstDatFile);
 
-    for batchIdx = 1:numel(batches)
-        batch = batches{batchIdx};
-        fprintf('  DMD%d batch %d/%d: ROI(s) %s\n', ...
-            dmdIdx, batchIdx, numel(batches), mat2str(batch));
+        hMDF = slap2.util.MultiDataFiles(firstDatFile);
+        validateParsePlanCompatibility(hMDF, dmdIdx);
+        [epochMasks, ~, epochSourceRoiIdx] = getIntegrationMasks(hMDF);
+        if params.manualROIs
+            % Manual masks intentionally differ from the acquisition's stored
+            % integration ROIs. Validate acquisition geometry/parse-plan
+            % stability, while retaining the user-defined masks across epochs.
+            validateDmdEpochMetadataCompatibility( ...
+                dmdIdx, epochIdx, summary.dmd(dmdIdx).metadata, getDmdMetadata(hMDF), ...
+                summary.dmd(dmdIdx).linesPerCycle, hMDF.header.linesPerCycle);
+        else
+            validateDmdEpochCompatibility( ...
+                dmdIdx, epochIdx, summary.dmd(dmdIdx).metadata, getDmdMetadata(hMDF), ...
+                summary.dmd(dmdIdx).linesPerCycle, hMDF.header.linesPerCycle, ...
+                summary.masks{dmdIdx}, epochMasks, ...
+                summary.roiTable.sourceRoiIdx(summary.roiTable.dmdIdx == dmdIdx)', ...
+                epochSourceRoiIdx);
+        end
 
-        [batchTraces, batchWeights, batchErrors] = extractRoiBatch( ...
-            hMDF, summary.masks{dmdIdx}, batch, params);
+        localRois = 1:summary.nAnalysisROIs(dmdIdx);
+        batches = makeBatches(localRois, params.maxConcurrentROIs);
 
-        for j = 1:numel(batch)
-            localRoiIdx = batch(j);
-            globalRoiIdx = summary.roiGlobalOffsets(dmdIdx) + localRoiIdx;
-            statusIdx = globalRoiIdx;
-            summary.extractionStatus(statusIdx).startedAt = char(datetime('now'));
+        for batchIdx = 1:numel(batches)
+            batch = batches{batchIdx};
+            fprintf('  DMD%d epoch %d batch %d/%d: ROI(s) %s\n', ...
+                dmdIdx, epochIdx, batchIdx, numel(batches), mat2str(batch));
 
-            if ~isempty(batchErrors{j})
-                summary.extractionStatus(statusIdx).status = 'failed';
-                summary.extractionStatus(statusIdx).errorMessage = batchErrors{j};
-                if params.stopOnError
-                    error('extractDendrites:ROIExtractionFailed', ...
-                        'DMD%d ROI%d failed: %s', dmdIdx, localRoiIdx, batchErrors{j});
+            [batchTraces, batchWeights, batchErrors] = extractRoiBatch( ...
+                hMDF, summary.masks{dmdIdx}, batch, params);
+
+            for j = 1:numel(batch)
+                localRoiIdx = batch(j);
+                globalRoiIdx = summary.roiGlobalOffsets(dmdIdx) + localRoiIdx;
+                statusIdx = globalRoiIdx;
+                if isempty(summary.extractionStatus(statusIdx).startedAt)
+                    summary.extractionStatus(statusIdx).startedAt = char(datetime('now'));
                 end
-                continue
+
+                if ~isempty(batchErrors{j})
+                    summary.extractionStatus(statusIdx).status = 'failed';
+                    summary.extractionStatus(statusIdx).errorMessage = batchErrors{j};
+                    if params.stopOnError
+                        error('extractDendrites:ROIExtractionFailed', ...
+                            'DMD%d epoch%d ROI%d failed: %s', ...
+                            dmdIdx, epochIdx, localRoiIdx, batchErrors{j});
+                    end
+                    continue
+                end
+
+                trace = castTrace(batchTraces{j}, params.precision);
+                summary.extractionStatus(statusIdx).nSamplesExtracted = ...
+                    summary.extractionStatus(statusIdx).nSamplesExtracted + numel(trace);
+                summary.extractionStatus(statusIdx).weightClass = class(batchWeights{j});
+                summary.extractionStatus(statusIdx).weightSize = sizeToString(size(batchWeights{j}));
+
+                if summary.outputPlan.writeContinuous
+                    writeContinuousTrace(summary, h5Path, trace, ...
+                        dmdIdx, localRoiIdx, epochIdx, params);
+                end
+                if summary.outputPlan.writeTrial
+                    writeTrialSlices(summary, trialInfo, h5Path, trace, ...
+                        dmdIdx, globalRoiIdx, epochTrials, params);
+                end
+
+                summary.extractionStatus(statusIdx).status = 'in_progress';
+                summary.extractionStatus(statusIdx).finishedAt = char(datetime('now'));
+                summary.extractionStatus(statusIdx).errorMessage = '';
+                clear trace
             end
 
-            trace = castTrace(batchTraces{j}, params.precision);
-            summary.extractionStatus(statusIdx).nSamplesExtracted = numel(trace);
-            summary.extractionStatus(statusIdx).weightClass = class(batchWeights{j});
-            summary.extractionStatus(statusIdx).weightSize = sizeToString(size(batchWeights{j}));
-
-            if summary.outputPlan.writeContinuous
-                writeContinuousTrace(summary, h5Path, trace, dmdIdx, localRoiIdx, params);
+            clear batchTraces batchWeights batchErrors
+            if params.saveSummaryAfterEachBatch
+                save(summaryPath, 'summary', '-v7.3');
             end
-            if summary.outputPlan.writeTrial
-                writeTrialSlices(summary, trialInfo, h5Path, trace, dmdIdx, globalRoiIdx, params);
-            end
-
-            summary.extractionStatus(statusIdx).status = 'complete';
-            summary.extractionStatus(statusIdx).finishedAt = char(datetime('now'));
-            summary.extractionStatus(statusIdx).errorMessage = '';
-
-            clear trace
         end
 
-        clear batchTraces batchWeights batchErrors
-        if params.saveSummaryAfterEachBatch
-            save(summaryPath, 'summary', '-v7.3');
-        end
+        delete(hMDF);
+        clear hMDF
     end
+end
 
-    delete(hMDF);
-    clear hMDF
+for idx = 1:numel(summary.extractionStatus)
+    if strcmp(summary.extractionStatus(idx).status, 'in_progress')
+        summary.extractionStatus(idx).status = 'complete';
+    end
 end
 end
 
@@ -411,7 +512,7 @@ function summary = extractTrialFiles(summary, trialInfo, dr, params, summaryPath
 % Non-CYCLE acquisitions are either true trial-file outputs or a single file
 % accidentally collected without a -CYCLE suffix. For the latter, continuous
 % output is safe because the one .dat file spans the whole imaging epoch. For
-% multi-file/multi-epoch acquisitions, keep trial outputs and preserve epoch
+% multi-file non-CYCLE acquisitions, keep trial outputs and preserve epoch
 % metadata rather than stitching discontinuous imaging periods into one trace.
 if wantsContinuous(params.outputMode) && ~summary.outputPlan.writeContinuous
     warning(['Continuous output for multi-trial non-CYCLE acquisitions is not implemented. ' ...
@@ -466,7 +567,7 @@ for trialIdx = 1:nTrials
                 summary.extractionStatus(statusIdx).weightSize = sizeToString(size(batchWeights{j}));
 
                 if summary.outputPlan.writeContinuous
-                    writeContinuousTrace(summary, h5Path, trace, dmdIdx, localRoiIdx, params);
+                    writeContinuousTrace(summary, h5Path, trace, dmdIdx, localRoiIdx, 1, params);
                 end
                 if summary.outputPlan.writeTrial
                     writeOneTrialSlice(summary, trialInfo, h5Path, trace, ...
@@ -595,15 +696,26 @@ end
 
 if summary.outputPlan.writeContinuous
     for dmdIdx = 1:summary.nDMDs
-        dset = continuousDatasetName(dmdIdx);
-        nRows = summary.dmd(dmdIdx).totalNumLines;
-        nCols = summary.nAnalysisROIs(dmdIdx);
-        createH5DatasetIfNeeded(h5Path, dset, [nRows, nCols], params);
-        h5writeatt(h5Path, dset, 'description', ...
-            'Continuous traces for one DMD. Columns are local ROI indices for this DMD.');
-        h5writeatt(h5Path, dset, 'dmdIdx', dmdIdx);
-        h5writeatt(h5Path, dset, 'globalRoiIdx', ...
-            summary.roiGlobalOffsets(dmdIdx) + (1:summary.nAnalysisROIs(dmdIdx)));
+        for epochIdx = 1:summary.nEpochs
+            epochRecord = summary.dmd(dmdIdx).epochs(epochIdx);
+            if ~epochRecord.available || epochRecord.totalNumLines < 1
+                continue
+            end
+            dset = continuousDatasetName(dmdIdx, epochIdx, summary.nEpochs);
+            nRows = epochRecord.totalNumLines;
+            nCols = summary.nAnalysisROIs(dmdIdx);
+            createH5DatasetIfNeeded(h5Path, dset, [nRows, nCols], params);
+            h5writeatt(h5Path, dset, 'description', ...
+                ['Epoch-local continuous traces for one DMD. Columns are local ROI ' ...
+                 'indices; sample indices restart at one for each acquisition epoch.']);
+            h5writeatt(h5Path, dset, 'dmdIdx', dmdIdx);
+            h5writeatt(h5Path, dset, 'epochIdx', epochIdx);
+            h5writeatt(h5Path, dset, 'acquisitionPrefix', epochRecord.filePrefix);
+            h5writeatt(h5Path, dset, 'firstTrial', epochRecord.firstTrial);
+            h5writeatt(h5Path, dset, 'lastTrial', epochRecord.lastTrial);
+            h5writeatt(h5Path, dset, 'globalRoiIdx', ...
+                summary.roiGlobalOffsets(dmdIdx) + (1:summary.nAnalysisROIs(dmdIdx)));
+        end
     end
 end
 
@@ -613,6 +725,11 @@ h5writeatt(h5Path, '/', 'outputMode', params.outputMode);
 h5writeatt(h5Path, '/', 'writeTrial', uint8(summary.outputPlan.writeTrial));
 h5writeatt(h5Path, '/', 'writeContinuous', uint8(summary.outputPlan.writeContinuous));
 h5writeatt(h5Path, '/', 'nEpochs', summary.nEpochs);
+if summary.nEpochs > 1
+    h5writeatt(h5Path, '/', 'continuousLayout', 'epoch_local');
+else
+    h5writeatt(h5Path, '/', 'continuousLayout', 'single_epoch');
+end
 h5writeatt(h5Path, '/', 'precision', params.precision);
 end
 
@@ -645,10 +762,17 @@ catch
 end
 end
 
-function writeContinuousTrace(summary, h5Path, trace, dmdIdx, localRoiIdx, params)
+function writeContinuousTrace(summary, h5Path, trace, dmdIdx, localRoiIdx, epochIdx, params)
 if strcmpi(params.storageMode, 'h5')
-    dset = continuousDatasetName(dmdIdx);
-    nWrite = min(numel(trace), summary.dmd(dmdIdx).totalNumLines);
+    dset = continuousDatasetName(dmdIdx, epochIdx, summary.nEpochs);
+    nExpected = summary.dmd(dmdIdx).epochs(epochIdx).totalNumLines;
+    nWrite = min(numel(trace), nExpected);
+    if numel(trace) ~= nExpected
+        warning('extractDendrites:ContinuousLengthMismatch', ...
+            ['DMD%d epoch%d ROI%d extracted %d samples, but metadata report %d lines. ' ...
+             'Writing the overlapping %d samples.'], ...
+            dmdIdx, epochIdx, localRoiIdx, numel(trace), nExpected, nWrite);
+    end
     h5write(h5Path, dset, trace(1:nWrite), [1, localRoiIdx], [nWrite, 1]);
 else
     error('extractDendrites:MemoryStorageUnsupported', ...
@@ -656,8 +780,9 @@ else
 end
 end
 
-function writeTrialSlices(summary, trialInfo, h5Path, trace, dmdIdx, globalRoiIdx, params)
-for trialIdx = 1:summary.nTrials
+function writeTrialSlices(summary, trialInfo, h5Path, trace, dmdIdx, globalRoiIdx, trialIndices, params)
+% Write only trials whose line coordinates belong to this epoch-local trace.
+for trialIdx = reshape(trialIndices, 1, [])
     writeOneTrialSlice(summary, trialInfo, h5Path, trace, ...
         dmdIdx, trialIdx, globalRoiIdx, params);
 end
@@ -718,8 +843,12 @@ function dset = trialDatasetName(trialIdx)
 dset = sprintf('/traces/trial_%04d', trialIdx);
 end
 
-function dset = continuousDatasetName(dmdIdx)
-dset = sprintf('/traces/continuous/DMD%d', dmdIdx);
+function dset = continuousDatasetName(dmdIdx, epochIdx, nEpochs)
+if nEpochs > 1
+    dset = sprintf('/traces/epochs/epoch_%04d/DMD%d', epochIdx, dmdIdx);
+else
+    dset = sprintf('/traces/continuous/DMD%d', dmdIdx);
+end
 end
 
 % -------------------------------------------------------------------------
@@ -1182,6 +1311,48 @@ if isempty(hMDF.zPixelReplacementMaps) || isempty(hMDF.lineSuperPixelIDs)
     error('extractDendrites:EmptyParsePlan', ...
         ['DMD%d has an empty parse plan after DataFile loading. Replace ' ...
          'loadParsePlan.m with the companion patched version.'], dmdIdx);
+end
+end
+
+function validateDmdEpochMetadataCompatibility( ...
+    dmdIdx, epochIdx, canonicalMeta, epochMeta, ...
+    canonicalLinesPerCycle, epochLinesPerCycle)
+%VALIDATEDMDEPOCHMETADATACOMPATIBILITY Validate geometry and parse-plan stability.
+fields = {'dmdPixelsPerRow', 'dmdPixelsPerColumn', 'samplesPerLine', 'channelsSave'};
+for k = 1:numel(fields)
+    name = fields{k};
+    a = getFieldOrEmpty(canonicalMeta, name);
+    b = getFieldOrEmpty(epochMeta, name);
+    if ~isempty(a) && ~isempty(b) && ~isequal(a, b)
+        error('extractDendrites:IncompatibleEpochMetadata', ...
+            'DMD%d epoch%d metadata field %s changed across epochs.', ...
+            dmdIdx, epochIdx, name);
+    end
+end
+if ~isequal(canonicalLinesPerCycle, epochLinesPerCycle)
+    error('extractDendrites:IncompatibleEpochParsePlan', ...
+        'DMD%d epoch%d linesPerCycle changed from %s to %s.', ...
+        dmdIdx, epochIdx, mat2str(canonicalLinesPerCycle), mat2str(epochLinesPerCycle));
+end
+end
+
+function validateDmdEpochCompatibility( ...
+    dmdIdx, epochIdx, canonicalMeta, epochMeta, ...
+    canonicalLinesPerCycle, epochLinesPerCycle, ...
+    canonicalMasks, epochMasks, canonicalSourceRoiIdx, epochSourceRoiIdx)
+%VALIDATEDMDEPOCHCOMPATIBILITY Ensure one ROI column means the same thing across epochs.
+validateDmdEpochMetadataCompatibility( ...
+    dmdIdx, epochIdx, canonicalMeta, epochMeta, ...
+    canonicalLinesPerCycle, epochLinesPerCycle);
+if ~isequal(size(canonicalMasks), size(epochMasks)) || ~isequal(canonicalMasks, epochMasks)
+    error('extractDendrites:IncompatibleEpochRois', ...
+        ['DMD%d epoch%d integration ROI masks differ from epoch 1. ' ...
+         'Do not concatenate these epochs as one ROI set.'], dmdIdx, epochIdx);
+end
+if ~isequal(double(canonicalSourceRoiIdx(:)), double(epochSourceRoiIdx(:)))
+    error('extractDendrites:IncompatibleEpochRoiOrder', ...
+        'DMD%d epoch%d integration ROI identities/order differ from epoch 1.', ...
+        dmdIdx, epochIdx);
 end
 end
 
