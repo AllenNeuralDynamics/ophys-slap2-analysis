@@ -37,6 +37,7 @@ for d = 1:numel(staticDirPaths)
 end
 
 for ix = 1:numel(missingReference)
+    disp(missingReference{ix});
     obj = slap2.gui.refstack.ReferenceStack.loadTif(missingReference{ix});
     clear obj;
 end
