@@ -152,6 +152,13 @@ roiRecords = struct('globalRoiIdx', {}, 'dmdIdx', {}, 'localRoiIdx', {}, ...
 
 fprintf('Discovering ROIs, reference images, and epoch-specific source files...\n');
 for dmdIdx = 1:nDMDs
+    % Track metadata initialization separately from ROI-mask emptiness. A DMD can
+    % legitimately have zero integration ROIs (e.g. a paired-modality recording
+    % where only the other DMD carries voltage ROIs). In that case
+    % getIntegrationMasks returns an nRows x nCols x 0 logical array, for which
+    % isempty(...) is true, so canonicalMasks cannot be used as an initialization
+    % sentinel.
+    canonicalInitialized = false;
     canonicalMasks = [];
     canonicalSourceRoiIdx = [];
     canonicalMeta = [];
@@ -188,7 +195,7 @@ for dmdIdx = 1:nDMDs
         dmdMeta = getDmdMetadata(hMDF);
         [epochMasks, epochMaskImage, epochSourceRoiIdx] = getIntegrationMasks(hMDF);
 
-        if isempty(canonicalMasks)
+        if ~canonicalInitialized
             canonicalMasks = epochMasks;
             canonicalSourceRoiIdx = epochSourceRoiIdx;
             canonicalMeta = dmdMeta;
@@ -219,6 +226,12 @@ for dmdIdx = 1:nDMDs
             if params.makePlots
                 plotDmdPreview(dmdIdx, refIM, epochMaskImage);
             end
+
+            canonicalInitialized = true;
+            if nAnalysisROIs(dmdIdx) == 0
+                fprintf(['  DMD%d has no integration ROIs. Retaining DMD/epoch metadata ' ...
+                    'and skipping ROI extraction for this DMD.\n'], dmdIdx);
+            end
         else
             validateDmdEpochCompatibility( ...
                 dmdIdx, epochIdx, canonicalMeta, dmdMeta, ...
@@ -237,7 +250,7 @@ for dmdIdx = 1:nDMDs
         clear hMDF
     end
 
-    assert(~isempty(canonicalMasks), 'No valid filenames found for DMD%d in any epoch.', dmdIdx);
+    assert(canonicalInitialized, 'No valid filenames found for DMD%d in any epoch.', dmdIdx);
     summary.dmd(dmdIdx).metadata = canonicalMeta;
     summary.dmd(dmdIdx).firstDatFile = firstCanonicalDatFile;
     summary.dmd(dmdIdx).totalNumLines = sum([epochRecords.totalNumLines]);
@@ -258,6 +271,11 @@ end
 
 summary.nAnalysisROIs = nAnalysisROIs;
 summary.nTotalROIs = sum(nAnalysisROIs);
+if summary.nTotalROIs == 0
+    error('extractDendrites:NoIntegrationRois', ...
+        ['No integration ROIs were found on any DMD. Zero-ROI DMDs are allowed, ' ...
+         'but at least one DMD must contain an integration ROI for extraction.']);
+end
 summary.roiTable = struct2table(roiRecords);
 summary.roiGlobalOffsets = [0, cumsum(nAnalysisROIs(1:end-1))];
 summary.extractionStatus = initializeStatus(summary.roiTable);
@@ -704,6 +722,13 @@ if summary.outputPlan.writeContinuous
             dset = continuousDatasetName(dmdIdx, epochIdx, summary.nEpochs);
             nRows = epochRecord.totalNumLines;
             nCols = summary.nAnalysisROIs(dmdIdx);
+            % A DMD with no integration ROIs is valid. There is no useful
+            % continuous trace dataset to create for it, and HDF5 chunked
+            % datasets cannot use a zero-sized ROI dimension with our [N x 1]
+            % chunk layout.
+            if nCols == 0
+                continue
+            end
             createH5DatasetIfNeeded(h5Path, dset, [nRows, nCols], params);
             h5writeatt(h5Path, dset, 'description', ...
                 ['Epoch-local continuous traces for one DMD. Columns are local ROI ' ...
