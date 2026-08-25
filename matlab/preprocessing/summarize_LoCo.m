@@ -61,6 +61,30 @@ if ~exist(savedr, 'dir')
 end
 fnsave = [savedr filesep 'SummaryLoCo-' datestr(now, 'YYmmDD-HHMMSS') '.mat'];
 
+% Persist authoritative SLAP2 acquisition metadata before any trial-level
+% processing. This mirrors the voltage extractor so downstream Python can
+% reconcile source acquisition epochs to HARP without inferring duration from
+% processed traces or rescaling the imaging timebase.
+if strcmpi(params.microscope, 'SLAP2')
+    slap2AcqInfo = collectSlap2AcquisitionInfo(trialTable, dr);
+    exptSummary.trialEpoch = slap2AcqInfo.trialEpoch;
+    exptSummary.trialFilePrefix = slap2AcqInfo.trialFilePrefix;
+    exptSummary.epochTable = slap2AcqInfo.epochTable;
+    exptSummary.nEpochs = slap2AcqInfo.nEpochs;
+    exptSummary.multiEpochAcquisition = slap2AcqInfo.nEpochs > 1;
+    exptSummary.dmd = slap2AcqInfo.dmd;
+    exptSummary.acquisitionMetadataSchemaVersion = '1.0';
+else
+    exptSummary.trialEpoch = ones(1, nTrials);
+    exptSummary.trialFilePrefix = repmat({''}, 1, nTrials);
+    exptSummary.epochTable = table(1, {''}, 1, nTrials, nTrials, ...
+        'VariableNames', {'epochIdx', 'filePrefix', 'firstTrial', 'lastTrial', 'nTrials'});
+    exptSummary.nEpochs = 1;
+    exptSummary.multiEpochAcquisition = false;
+    exptSummary.dmd = repmat(struct(), 1, nDMDs);
+    exptSummary.acquisitionMetadataSchemaVersion = 'not_slap2';
+end
+
 %call up a GUI for the user to define Soma ROI and regions to exclude
 if params.drawUserRois
     fnPostAcqAnn = [dr filesep 'postAcqANNOTATIONS.mat'];
@@ -385,6 +409,319 @@ else
 end
 
 disp('Done summarize_LoCo')
+end
+
+
+function info = collectSlap2AcquisitionInfo(trialTable, dr)
+%COLLECTSLAP2ACQUISITIONINFO Preserve raw SLAP2 acquisition/epoch metadata.
+%
+% The trial-wise SummaryLoCo traces are sampled at params.analyzeHz, but the
+% authoritative acquisition duration lives in the raw SLAP2 files. For each DMD
+% and acquisition epoch, open the corresponding MultiDataFiles object and retain
+% actual nCycles/totalNumLines plus line-rate/parse-plan metadata. Downstream
+% Python uses totalNumLines / lineRateHz for source-epoch duration QC, matching
+% the voltage pipeline.
+
+hasFilename = (isstruct(trialTable) && isfield(trialTable, 'filename')) || ...
+    (istable(trialTable) && any(strcmp(trialTable.Properties.VariableNames, 'filename')));
+if ~hasFilename
+    error('summarize_LoCo:MissingFilename', ...
+        'SLAP2 trialTable must contain filename to recover acquisition metadata.');
+end
+filename = trialTable.filename;
+if isstring(filename)
+    filename = cellstr(filename);
+end
+if ~iscell(filename)
+    error('summarize_LoCo:InvalidFilename', ...
+        'trialTable.filename must be a cell array or string array.');
+end
+[nDMDs, nTrials] = size(filename);
+[trialEpoch, trialFilePrefix, epochTable] = inferSlap2AcquisitionEpochs(filename, trialTable);
+nEpochs = height(epochTable);
+
+info = struct();
+info.trialEpoch = trialEpoch;
+info.trialFilePrefix = trialFilePrefix;
+info.epochTable = epochTable;
+info.nEpochs = nEpochs;
+info.dmd = repmat(struct(), 1, nDMDs);
+
+for dmdIdx = 1:nDMDs
+    epochRecords = repmat(struct( ...
+        'epochIdx', [], 'filePrefix', '', 'firstTrial', [], 'lastTrial', [], ...
+        'firstDatFile', '', 'totalNumLines', 0, 'nCycles', 0, ...
+        'linesPerCycle', [], 'durationSec', nan, 'cycleRateHz', nan, ...
+        'metadata', struct(), 'available', false), 1, nEpochs);
+
+    canonicalMeta = struct();
+    canonicalLinesPerCycle = [];
+    firstCanonicalDatFile = '';
+
+    for epochIdx = 1:nEpochs
+        epochTrials = find(trialEpoch == epochIdx);
+        validTrials = epochTrials(~cellfun(@isempty, filename(dmdIdx, epochTrials)));
+
+        epochRecords(epochIdx).epochIdx = epochIdx;
+        epochRecords(epochIdx).firstTrial = epochTrials(1);
+        epochRecords(epochIdx).lastTrial = epochTrials(end);
+        epochRecords(epochIdx).filePrefix = epochTable.filePrefix{epochIdx};
+
+        if isempty(validTrials)
+            warning('summarize_LoCo:MissingDmdEpoch', ...
+                'DMD%d has no raw SLAP2 filename for acquisition epoch %d.', ...
+                dmdIdx, epochIdx);
+            continue
+        end
+
+        firstTrialThisEpoch = validTrials(1);
+        firstDatFile = resolveSlap2DataFilePath(dr, filename{dmdIdx, firstTrialThisEpoch});
+        fprintf('SLAP2 acquisition metadata DMD%d epoch%d: %s\n', ...
+            dmdIdx, epochIdx, firstDatFile);
+        hMDF = slap2.util.MultiDataFiles(firstDatFile);
+        dmdMeta = getSlap2DmdMetadata(hMDF);
+
+        if isempty(fieldnames(canonicalMeta))
+            canonicalMeta = dmdMeta;
+            canonicalLinesPerCycle = hMDF.header.linesPerCycle;
+            firstCanonicalDatFile = firstDatFile;
+        else
+            warnSlap2EpochMetadataChange( ...
+                dmdIdx, epochIdx, canonicalMeta, dmdMeta, ...
+                canonicalLinesPerCycle, hMDF.header.linesPerCycle);
+        end
+
+        epochRecords(epochIdx).firstDatFile = firstDatFile;
+        epochRecords(epochIdx).totalNumLines = double(hMDF.totalNumLines);
+        epochRecords(epochIdx).nCycles = double(hMDF.numCycles);
+        epochRecords(epochIdx).linesPerCycle = double(hMDF.header.linesPerCycle);
+        epochRecords(epochIdx).metadata = dmdMeta;
+        epochRecords(epochIdx).available = true;
+
+        lineRateHz = scalarNumericField(dmdMeta, 'lineRateHz');
+        if isfinite(lineRateHz) && lineRateHz > 0
+            epochRecords(epochIdx).durationSec = double(hMDF.totalNumLines) / lineRateHz;
+            if ~isempty(hMDF.header.linesPerCycle) && double(hMDF.header.linesPerCycle) > 0
+                epochRecords(epochIdx).cycleRateHz = lineRateHz / double(hMDF.header.linesPerCycle);
+            end
+        end
+    end
+
+    info.dmd(dmdIdx).metadata = canonicalMeta;
+    info.dmd(dmdIdx).epochs = epochRecords;
+    info.dmd(dmdIdx).firstDatFile = firstCanonicalDatFile;
+    info.dmd(dmdIdx).totalNumLines = sum([epochRecords.totalNumLines]);
+    info.dmd(dmdIdx).nCycles = sum([epochRecords.nCycles]);
+    info.dmd(dmdIdx).linesPerCycle = canonicalLinesPerCycle;
+end
+end
+
+
+function [trialEpoch, trialFilePrefix, epochTable] = inferSlap2AcquisitionEpochs(filename, trialTable)
+%INFERSLAP2ACQUISITIONEPOCHS Identify source acquisition blocks in trial order.
+%
+% Explicit trialEpoch/epoch labels are preferred when they are informative.
+% Otherwise filename-prefix changes define acquisition restarts. Empty filenames
+% are filled from neighboring trials so a missing/invalid trial does not create a
+% spurious acquisition epoch.
+
+[~, nTrials] = size(filename);
+trialFilePrefix = repmat({''}, 1, nTrials);
+for trialIdx = 1:nTrials
+    fns = filename(:, trialIdx);
+    fns = fns(~cellfun(@isempty, fns));
+    if ~isempty(fns)
+        trialFilePrefix{trialIdx} = slap2AcquisitionPrefixFromFilename(fns{1});
+    end
+end
+
+% Fill missing prefixes from surrounding trials; raw-file absence should not by
+% itself imply that SLAP2 acquisition restarted.
+for trialIdx = 2:nTrials
+    if isempty(trialFilePrefix{trialIdx})
+        trialFilePrefix{trialIdx} = trialFilePrefix{trialIdx - 1};
+    end
+end
+for trialIdx = nTrials-1:-1:1
+    if isempty(trialFilePrefix{trialIdx})
+        trialFilePrefix{trialIdx} = trialFilePrefix{trialIdx + 1};
+    end
+end
+
+explicitEpoch = [];
+try
+    if istable(trialTable)
+        vars = trialTable.Properties.VariableNames;
+        if any(strcmp(vars, 'trialEpoch'))
+            explicitEpoch = double(trialTable.trialEpoch(:))';
+        elseif any(strcmp(vars, 'epoch'))
+            explicitEpoch = double(trialTable.epoch(:))';
+        end
+    elseif isstruct(trialTable)
+        if isfield(trialTable, 'trialEpoch')
+            explicitEpoch = double(trialTable.trialEpoch(:))';
+        elseif isfield(trialTable, 'epoch')
+            explicitEpoch = double(trialTable.epoch(:))';
+        end
+    end
+catch
+    explicitEpoch = [];
+end
+
+finiteExplicit = explicitEpoch(isfinite(explicitEpoch));
+if numel(explicitEpoch) == nTrials && numel(unique(finiteExplicit)) > 1
+    trialEpoch = relabelSlap2EpochVectorStable(explicitEpoch);
+else
+    trialEpoch = ones(1, nTrials);
+    currentEpoch = 1;
+    prevPrefix = trialFilePrefix{1};
+    for trialIdx = 2:nTrials
+        thisPrefix = trialFilePrefix{trialIdx};
+        if ~strcmp(thisPrefix, prevPrefix)
+            currentEpoch = currentEpoch + 1;
+            prevPrefix = thisPrefix;
+        end
+        trialEpoch(trialIdx) = currentEpoch;
+    end
+end
+
+epochIds = unique(trialEpoch, 'stable');
+epochIdxCol = epochIds(:);
+filePrefixCol = cell(numel(epochIds), 1);
+firstTrialCol = zeros(numel(epochIds), 1);
+lastTrialCol = zeros(numel(epochIds), 1);
+nTrialsCol = zeros(numel(epochIds), 1);
+for k = 1:numel(epochIds)
+    ep = epochIds(k);
+    trials = find(trialEpoch == ep);
+    firstTrialCol(k) = trials(1);
+    lastTrialCol(k) = trials(end);
+    nTrialsCol(k) = numel(trials);
+    prefixes = trialFilePrefix(trials);
+    prefixes = prefixes(~cellfun(@isempty, prefixes));
+    if isempty(prefixes)
+        filePrefixCol{k} = '';
+    else
+        filePrefixCol{k} = prefixes{1};
+    end
+end
+
+epochTable = table(epochIdxCol, filePrefixCol, firstTrialCol, lastTrialCol, nTrialsCol, ...
+    'VariableNames', {'epochIdx', 'filePrefix', 'firstTrial', 'lastTrial', 'nTrials'});
+end
+
+
+function trialEpoch = relabelSlap2EpochVectorStable(epochVals)
+%RELABELSLAP2EPOCHVECTORSTABLE Convert arbitrary labels to consecutive 1..N.
+trialEpoch = ones(size(epochVals));
+seen = [];
+current = 1;
+for idx = 1:numel(epochVals)
+    val = epochVals(idx);
+    if ~isfinite(val)
+        trialEpoch(idx) = current;
+        continue
+    end
+    match = find(seen == val, 1, 'first');
+    if isempty(match)
+        seen(end + 1) = val; %#ok<AGROW>
+        match = numel(seen);
+    end
+    current = match;
+    trialEpoch(idx) = match;
+end
+end
+
+
+function prefix = slap2AcquisitionPrefixFromFilename(fn)
+%SLAP2ACQUISITIONPREFIXFROMFILENAME Strip DMD/CYCLE suffixes from raw filename.
+[~, name, ~] = fileparts(char(fn));
+prefix = regexprep(name, '[_-]DMD\d+.*$', '', 'ignorecase');
+prefix = regexprep(prefix, '[_-]CYCLE[_-]?\d+.*$', '', 'ignorecase');
+if isempty(prefix)
+    prefix = name;
+end
+end
+
+
+function datPath = resolveSlap2DataFilePath(dr, filename)
+%RESOLVESLAP2DATAFILEPATH Resolve an absolute or session-relative raw .dat path.
+filename = char(filename);
+if exist(filename, 'file')
+    datPath = filename;
+elseif exist(fullfile(dr, filename), 'file')
+    datPath = fullfile(dr, filename);
+else
+    error('summarize_LoCo:MissingDataFile', 'Could not find raw SLAP2 data file: %s', filename);
+end
+end
+
+
+function dmdMeta = getSlap2DmdMetadata(hMDF)
+%GETSLAP2DMDMETADATA Extract compact acquisition/parse-plan metadata.
+dmdMeta = struct();
+dmdMeta.dmdPixelsPerRow = getStructFieldOrEmpty(hMDF.metaData, 'dmdPixelsPerRow');
+dmdMeta.dmdPixelsPerColumn = getStructFieldOrEmpty(hMDF.metaData, 'dmdPixelsPerColumn');
+dmdMeta.linePeriod_s = getStructFieldOrEmpty(hMDF.metaData, 'linePeriod_s');
+dmdMeta.samplesPerLine = getStructFieldOrEmpty(hMDF.metaData, 'samplesPerLine');
+dmdMeta.channelsSave = getStructFieldOrEmpty(hMDF.metaData, 'channelsSave');
+dmdMeta.acqDuration_s = getStructFieldOrEmpty(hMDF.metaData, 'acqDuration_s');
+dmdMeta.acqDurationCycles = getStructFieldOrEmpty(hMDF.metaData, 'acqDurationCycles');
+if isfield(hMDF.metaData, 'AcquisitionContainer') && ...
+        isfield(hMDF.metaData.AcquisitionContainer, 'ParsePlan')
+    pp = hMDF.metaData.AcquisitionContainer.ParsePlan;
+    dmdMeta.parsePlanZs = getStructFieldOrEmpty(pp, 'zs');
+    dmdMeta.lineRateHz = getStructFieldOrEmpty(pp, 'lineRateHz');
+    dmdMeta.linesPerCycle = getStructFieldOrEmpty(pp, 'linesPerCycle');
+    dmdMeta.linesPerFrame = getStructFieldOrEmpty(pp, 'linesPerFrame');
+    dmdMeta.pixPerLine = getStructFieldOrEmpty(pp, 'pixPerLine');
+end
+if isempty(dmdMeta.linePeriod_s) && isfield(dmdMeta, 'lineRateHz') && ~isempty(dmdMeta.lineRateHz)
+    dmdMeta.linePeriod_s = 1 ./ double(dmdMeta.lineRateHz);
+end
+end
+
+
+function warnSlap2EpochMetadataChange(dmdIdx, epochIdx, canonicalMeta, epochMeta, canonicalLinesPerCycle, epochLinesPerCycle)
+%WARNSLAP2EPOCHMETADATACHANGE Flag acquisition changes while preserving metadata.
+if ~isequal(canonicalLinesPerCycle, epochLinesPerCycle)
+    warning('summarize_LoCo:EpochLinesPerCycleChanged', ...
+        'DMD%d epoch%d linesPerCycle changed from %s to %s.', ...
+        dmdIdx, epochIdx, mat2str(canonicalLinesPerCycle), mat2str(epochLinesPerCycle));
+end
+for fieldName = {'lineRateHz', 'dmdPixelsPerRow', 'dmdPixelsPerColumn', 'samplesPerLine', 'channelsSave'}
+    name = fieldName{1};
+    a = getStructFieldOrEmpty(canonicalMeta, name);
+    b = getStructFieldOrEmpty(epochMeta, name);
+    if ~isempty(a) && ~isempty(b) && ~isequal(a, b)
+        warning('summarize_LoCo:EpochMetadataChanged', ...
+            'DMD%d epoch%d acquisition metadata field %s changed across epochs.', ...
+            dmdIdx, epochIdx, name);
+    end
+end
+end
+
+
+function val = getStructFieldOrEmpty(s, fieldName)
+if isstruct(s) && isfield(s, fieldName)
+    val = s.(fieldName);
+else
+    val = [];
+end
+end
+
+
+function value = scalarNumericField(s, fieldName)
+value = nan;
+if ~isstruct(s) || ~isfield(s, fieldName) || isempty(s.(fieldName))
+    return
+end
+try
+    arr = double(s.(fieldName));
+    value = arr(1);
+catch
+    value = nan;
+end
 end
 
 
