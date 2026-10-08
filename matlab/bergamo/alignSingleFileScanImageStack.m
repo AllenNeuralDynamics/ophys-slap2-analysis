@@ -103,6 +103,14 @@ bfsave(squeeze(IM(:,:,1,:)), outputPathCh1, 'BigTiff', true, 'metadata', metadat
 %bfsave(squeeze(IMsk(:,:,1,:)), outputPathCh1sk, 'BigTiff', true);
 %bfsave(squeeze(IMsk(:,:,2,:)), outputPathCh2sk, 'BigTiff', true);
 
+if numChannels > 1
+    outputPathCh2 = [tiffFn(1:end-4) '-REF_Ch2.ome.tif'];
+    metadata2 = createMinimalOMEXMLMetadata(squeeze(IM(:,:,2,:)));
+    metadata2.setPixelsPhysicalSizeX(pixelSizeObj, 0);
+    metadata2.setPixelsPhysicalSizeY(pixelSizeObj, 0);
+    metadata2.setPixelsPhysicalSizeZ(pixelSizeZObj, 0);
+    bfsave(squeeze(IM(:,:,2,:)), outputPathCh2, 'BigTiff', true, 'metadata', metadata2);
+end
 
 
 end
