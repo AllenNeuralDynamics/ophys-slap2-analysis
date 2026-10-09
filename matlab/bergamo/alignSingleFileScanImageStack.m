@@ -30,6 +30,7 @@ end
 
 numChannels = length(SI.hChannels.channelSave);
 numFramesPerSlice = SI.hStackManager.framesPerSlice;
+numVolumes = SI.hStackManager.numVolumes;
 zStep = SI.hStackManager.actualStackZStepSize;
 numZs = SI.hStackManager.actualNumSlices;
 
@@ -46,11 +47,13 @@ end
 IM = []; IMc = []; IMsk = [];
 for Zix = numZs:-1:1
     disp(['Aligning plane: ' int2str(Zix) ' of ' int2str(numZs)])
-    imIdxsThisPlane = numChannels*numFramesPerSlice*(Zix-1)+ (1:(numChannels*numFramesPerSlice));
+    framesPerVolume = numChannels*numFramesPerSlice*numZs;
+    imIdxsThisPlane = numChannels*numFramesPerSlice*(Zix-1) + (1:(numChannels*numFramesPerSlice))' + framesPerVolume*(0:numVolumes-1);
+    imIdxsThisPlane = imIdxsThisPlane(:);
     
     % data order is XYCT
     IMtmp = permute(single(IMs(:,:,imIdxsThisPlane)), [2 1 3]); %transpose image; needed for bidi artifact detection by normcorr
-    IMtmp = reshape(IMtmp,size(IMtmp,1),size(IMtmp,2),numChannels,numFramesPerSlice);
+    IMtmp = reshape(IMtmp,size(IMtmp,1),size(IMtmp,2),numChannels,numFramesPerSlice*numVolumes);
 
     % align
     [IM(:,:,:,Zix), IMc(:,:,:,Zix), IMsk(:,:,:,Zix)] = alignMultiChannel(IMtmp, b, a);
