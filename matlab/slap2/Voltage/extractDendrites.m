@@ -56,7 +56,7 @@ import ScanImageTiffReader.ScanImageTiffReader
 % -------------------------------------------------------------------------
 
 if nargin < 1 || isempty(dr_or_pathToTrialTable)
-    [trialTablefn, dr] = uigetfile({'*.mat', 'MAT-files (*.mat)'}, 'Select trialTable.mat');
+    [trialTablefn, dr] = uigetfile({'*.mat;*.h5', 'Trial table files (*.mat, *.h5)'}, 'Select trial table');
     assert(~isnumeric(trialTablefn), 'No trialTable file selected.');
 else
     [dr, trialTablefn] = resolveTrialTablePath(dr_or_pathToTrialTable);
@@ -99,9 +99,7 @@ end
 % -------------------------------------------------------------------------
 
 fprintf('Loading trial table: %s\n', fullfile(dr, trialTablefn));
-S = load(fullfile(dr, trialTablefn), 'trialTable');
-trialTable = S.trialTable;
-clear S
+trialTable = loadTrialTable(fullfile(dr, trialTablefn));
 
 trialInfo = buildTrialInfo(trialTable);
 nDMDs = size(trialInfo.filename, 1);
@@ -1079,10 +1077,92 @@ end
 % Metadata and trial table helpers
 % -------------------------------------------------------------------------
 
+function trialTable = loadTrialTable(path)
+[~, ~, ext] = fileparts(path);
+if strcmpi(ext, '.h5')
+    trialTable = readTrialTableH5(path);
+    trialTable = normalizeH5TrialTable(trialTable);
+else
+    S = load(path, 'trialTable');
+    trialTable = S.trialTable;
+end
+end
+
+function trialTable = normalizeH5TrialTable(trialTable)
+% Hoist GIAnT-MATLAB H5 trial table's nested slap2_info fields to the
+% top-level camelCase names that buildTrialInfo expects.
+if isfield(trialTable, 'slap2_info') && ~isfield(trialTable, 'firstLine')
+    si = trialTable.slap2_info;
+    if isfield(si, 'first_line'), trialTable.firstLine = si.first_line; end
+    if isfield(si, 'last_line'),  trialTable.lastLine  = si.last_line;  end
+end
+end
+
+function s = readTrialTableH5(filename)
+% Inline HDF5 struct reader — mirrors GIAnT-MATLAB's loadStructFromH5 so
+% extractDendrites does not require GIAnT-MATLAB on the path.
+if ~exist(filename, 'file')
+    error('extractDendrites:TrialTableNotFound', 'File not found: %s', filename);
+end
+info = h5info(filename);
+s = readH5Group(filename, info);
+% Translate DMD1/DMD2 ref_stack field names to Path1/Path2 (GIAnT convention)
+if isfield(s, 'slap2_info') && isstruct(s.slap2_info) && isfield(s.slap2_info, 'ref_stack')
+    rs = s.slap2_info.ref_stack;
+    for fn = fieldnames(rs)'
+        tok = regexp(fn{1}, '^DMD(\d+)$', 'tokens', 'once');
+        if ~isempty(tok)
+            pathFn = ['Path' tok{1}];
+            if ~isfield(rs, pathFn)
+                rs.(pathFn) = rs.(fn{1});
+            end
+            rs = rmfield(rs, fn{1});
+        end
+    end
+    s.slap2_info.ref_stack = rs;
+end
+end
+
+function s = readH5Group(filename, grpInfo)
+s = struct();
+filenameCellFields = {'filename', 'fn_reg_ds', 'fn_raw', 'fn_adata', 'fn_ann'};
+for ix = 1:numel(grpInfo.Datasets)
+    ds = grpInfo.Datasets(ix);
+    if strcmp(grpInfo.Name, '/')
+        path = ['/' ds.Name];
+    else
+        path = [grpInfo.Name '/' ds.Name];
+    end
+    val = h5read(filename, path);
+    if isstring(val)
+        if any(strcmp(ds.Name, filenameCellFields))
+            val = reshape(cellstr(val(:)), size(val));
+        elseif isscalar(val)
+            val = char(val);
+        else
+            val = cellstr(val);
+        end
+    elseif ischar(val) && any(strcmp(ds.Name, filenameCellFields)) && isvector(val)
+        val = {strtrim(val(:)')};
+    end
+    s.(ds.Name) = val;
+end
+for ix = 1:numel(grpInfo.Groups)
+    grp = grpInfo.Groups(ix);
+    parts = strsplit(grp.Name, '/');
+    grpName = parts{end};
+    s.(grpName) = readH5Group(filename, grp);
+end
+end
+
 function [dr, trialTablefn] = resolveTrialTablePath(dr_or_pathToTrialTable)
 if exist(dr_or_pathToTrialTable, 'dir')
     dr = char(dr_or_pathToTrialTable);
-    trialTablefn = 'trialTable.mat';
+    if exist(fullfile(dr, 'trial_table.h5'), 'file')
+        trialTablefn = 'trial_table.h5';
+    else
+        trialTablefn = 'trialTable.mat';
+    end
 else
     [dr, name, ext] = fileparts(char(dr_or_pathToTrialTable));
     if isempty(dr)
