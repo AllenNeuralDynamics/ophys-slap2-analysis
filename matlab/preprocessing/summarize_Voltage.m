@@ -10,13 +10,17 @@ else
     params = setParams('summarize_Voltage');
 end
 if ~nargin
-    [trialTablefn, dr] = uigetfile('*trialTable*.mat');
+    [trialTablefn, dr] = uigetfile({'*trialTable*.mat;*trial_table*.h5', 'Trial table (*.mat, *.h5)'}, 'Select trial table');
 else
     %parse dr
     %_or_pathToTrialTable
     if exist(dr_or_pathToTrialTable, 'dir')
         dr = dr_or_pathToTrialTable;
-        trialTablefn = 'trialTable.mat';
+        if exist(fullfile(dr, 'trial_table.h5'), 'file')
+            trialTablefn = 'trial_table.h5'; % GIAnT-MATLAB layout
+        else
+            trialTablefn = 'trialTable.mat';
+        end
     else
         [dr, trialTablefn, ext] = fileparts(dr_or_pathToTrialTable);
         trialTablefn = [trialTablefn ext];
@@ -24,17 +28,24 @@ else
 end
 copyReadDeleteScanImageTiff([]); %make sure we can use the function in parallel loops
 
-%confirm that all files exist
-[trialTable, keepTrials] = verifyFiles(trialTablefn, dr, params);
-for dmdIx = 1:numel(trialTable.refStack)
-    trialTable.refStack{dmdIx}.IM = []; %this uses a lot of memory and we won't need it
+%confirm that all files exist. dirs.dataDr holds raw .dat files and reference
+%TIFFs, dirs.mocoDr the alignment data, dirs.saveDr the output root. For a
+%trialTable.mat all three equal dr; for a GIAnT trial_table.h5 they come from
+%the table's datadr/savedr fields.
+[trialTable, keepTrials, dirs] = verifyFiles(trialTablefn, dr, params);
+if isfield(trialTable, 'refStack') && iscell(trialTable.refStack)
+    for dmdIx = 1:numel(trialTable.refStack)
+        if isstruct(trialTable.refStack{dmdIx}) && isfield(trialTable.refStack{dmdIx}, 'IM')
+            trialTable.refStack{dmdIx}.IM = []; %this uses a lot of memory and we won't need it
+        end
+    end
 end
 nTrials = size(trialTable.filename,2);
 
-disp(['## SUMMARIZING' newline 'Folder:'])
-disp(dr)
+disp(['## SUMMARIZING' newline 'Data folder:'])
+disp(dirs.dataDr)
 
-savedr = [dr filesep 'ExperimentSummary'];
+savedr = [dirs.saveDr filesep 'ExperimentSummary'];
 % on CodeOcean /data is read-only and we save to /results
 is_CodeOcean = ~(getenv("CO_CPUS") == "");
 if is_CodeOcean
@@ -50,8 +61,8 @@ nDMDs =size(trialTable.filename,1);
 rTot = 0;
 for DMDix = 1:nDMDs
     %load image data
-    firstValidTrial = find(~isempty(trialTable.filename(DMDix,:)), 1, 'first');
-    hDataFile = slap2.util.DataFile([dr filesep trialTable.filename{DMDix,firstValidTrial}]);
+    firstValidTrial = find(~cellfun(@isempty, trialTable.filename(DMDix,:)), 1, 'first');
+    hDataFile = slap2.util.DataFile([dirs.dataDr filesep trialTable.filename{DMDix,firstValidTrial}]);
 
     imagingRois = hDataFile.metaData.AcquisitionContainer.ROIs.rois;
     isIntegration = false(1,length(imagingRois));
@@ -79,7 +90,7 @@ for DMDix = 1:nDMDs
     end
 
     %load reference image
-    refFn = dir([dr filesep '**' filesep '*DMD' int2str(DMDix) '*REFERENCE*.tif']);
+    refFn = dir([dirs.dataDr filesep '**' filesep '*DMD' int2str(DMDix) '*REFERENCE*.tif']);
     assert(length(refFn)==1, 'Found multiple reference images in the folder (possibly in nested folders!)');
     A = ScanImageTiffReader([refFn.folder filesep refFn.name]);
     IDs = A.descriptions;
@@ -104,7 +115,7 @@ for DMDix = 1:nDMDs
     clear stack
 
     if params.manualRois
-        hROIs = drawROIs(imPlane, dr, refFn.name, outlines);
+        hROIs = drawROIs(imPlane, dirs.saveDr, refFn.name, outlines); %manual ROIs are saved next to the other outputs
         waitfor(hROIs.hF);
         nAnalysisROIs(DMDix) = numel(hROIs.roiData);
         summary.masks{DMDix} = false(0);
@@ -127,7 +138,7 @@ for DMDix = 1:nDMDs
 end
 summary.userROIs = maskImage;
 
-for DMDix = [1 2]
+for DMDix = 1:nDMDs
 
     %extract signal for each superpixel
     disp('Reading Voltage data')
@@ -146,13 +157,15 @@ for DMDix = [1 2]
     for trialIx = 1:nTrials
         disp(['Processing Trial ' int2str(trialIx)]);
         if keepTrials(DMDix,trialIx)
-            S = load([dr filesep fnA{trialIx}], 'aData'); %LOAD ALIGNMENT DATA
-            aData{trialIx} = rmfield(S.aData, 'varFacDS');
+            aData{trialIx} = readAlignmentData(fullfile(dirs.mocoDr, fnA{trialIx})); %LOAD ALIGNMENT DATA (.mat or GIAnT .h5)
+            if isfield(aData{trialIx}, 'varFacDS')
+                aData{trialIx} = rmfield(aData{trialIx}, 'varFacDS');
+            end
             [~,fn, ext] = fileparts(fns{trialIx});
             if isempty(summary.footprints{DMDix})
-                [E{trialIx}, summary.footprints{DMDix}]= loadAndProcessVoltage(dr, [fn ext], fls(trialIx), els(trialIx), aData{trialIx}, masks, params);
+                [E{trialIx}, summary.footprints{DMDix}]= loadAndProcessVoltage(dirs.dataDr, [fn ext], fls(trialIx), els(trialIx), aData{trialIx}, masks, params);
             else
-                E{trialIx}= loadAndProcessVoltage(dr, [fn ext], fls(trialIx), els(trialIx), aData{trialIx}, masks, params);
+                E{trialIx}= loadAndProcessVoltage(dirs.dataDr, [fn ext], fls(trialIx), els(trialIx), aData{trialIx}, masks, params);
             end
         end
     end
@@ -163,7 +176,9 @@ end
 %prepare file for saving
 summary.params = params;
 summary.trialTable = trialTable;
-summary.dr = dr;
+summary.dr = dirs.dataDr;
+summary.dirs = dirs;
+summary.trialTablePath = fullfile(dr, trialTablefn);
 
 %save
 save(fnsave, 'summary', "-v7.3");

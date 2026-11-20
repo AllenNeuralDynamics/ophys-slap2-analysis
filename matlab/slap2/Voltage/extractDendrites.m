@@ -949,6 +949,24 @@ end
 function tmp = maskFromShapeData(shape, nRows, nCols, sourceRoiIdx)
 %MASKFROMSHAPEDATA Legacy fallback for metadata without stored ROI masks.
 shape = double(shape);
+if isvector(shape) && numel(shape) == 4
+    % Rectangle ROI (slap2.roi.RectangleRoi): shapeData = [x y w h], x = column,
+    % y = row, covering columns x:x+w-1 and rows y:y+h-1 (negative w/h allowed).
+    % Same convention as RectangleRoi.fovIndices; clipped to the DMD image.
+    x = round(shape(1)); y = round(shape(2));
+    w = round(shape(3)); h = round(shape(4));
+    xx = sort([x, x + w]); yy = sort([y, y + h]);
+    xx(2) = xx(2) - 1; yy(2) = yy(2) - 1;
+    if xx(1) < 1 || xx(2) > nCols || yy(1) < 1 || yy(2) > nRows
+        warning('extractDendrites:ShapeDataOutOfBounds', ...
+            'ROI %d rectangle extends outside the DMD image; clipping it.', sourceRoiIdx);
+    end
+    xx = min(max(1, xx), nCols);
+    yy = min(max(1, yy), nRows);
+    tmp = false(nRows, nCols);
+    tmp(yy(1):yy(2), xx(1):xx(2)) = true;
+    return
+end
 if size(shape, 2) < 2
     error('extractDendrites:InvalidShapeData', ...
         'ROI %d shapeData must have at least two columns.', sourceRoiIdx);
